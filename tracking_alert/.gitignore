@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+outputs/
+*.pt
+*.onnx
+*.mp4
+*.avi
+*.mov
+.DS_Store
+.idea/
+.vscode/
