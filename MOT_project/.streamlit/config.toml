@@ -1,0 +1,2 @@
+[server]
+maxUploadSize = 1024  # 업로드 제한을 1024MB (1GB)로 설정 (원하는 크기로 변경 가능)
