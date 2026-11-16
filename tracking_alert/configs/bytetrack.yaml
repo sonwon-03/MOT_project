@@ -1,0 +1,8 @@
+# 검출 신뢰도를 낮춰도 약한 박스가 새 추적으로 살아남도록 임계값을 맞춤
+tracker_type: bytetrack
+track_high_thresh: 0.1
+track_low_thresh: 0.05
+new_track_thresh: 0.1
+track_buffer: 45
+match_thresh: 0.8
+fuse_score: True

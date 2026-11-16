@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
+
+_CONFIGS = Path(__file__).resolve().parents[1] / "configs"
 
 
 @dataclass
@@ -20,6 +23,32 @@ class TrackedObject:
         return (0.5 * (x1 + x2), 0.5 * (y1 + y2))
 
 
+def _tracker_yaml_for_conf(conf: float) -> str:
+    """YOLO conf보다 높은 new_track_thresh 때문에 약한 검출이 버려지지 않게 맞춤."""
+    conf = float(max(0.01, min(0.9, conf)))
+    high = conf
+    low = max(0.01, conf * 0.5)
+    new = conf
+    _CONFIGS.mkdir(parents=True, exist_ok=True)
+    path = _CONFIGS / f"bytetrack_conf{conf:.2f}.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "tracker_type: bytetrack",
+                f"track_high_thresh: {high:.3f}",
+                f"track_low_thresh: {low:.3f}",
+                f"new_track_thresh: {new:.3f}",
+                "track_buffer: 45",
+                "match_thresh: 0.8",
+                "fuse_score: True",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
 class YoloByteTracker:
     """Ultralytics YOLO + ByteTrack 래퍼."""
 
@@ -27,7 +56,7 @@ class YoloByteTracker:
         self,
         model_name: str = "yolov8n.pt",
         tracker_cfg: str = "bytetrack.yaml",
-        conf: float = 0.35,
+        conf: float = 0.1,
         iou: float = 0.5,
         classes: Optional[tuple[int, ...]] = (0, 2, 3, 5, 7),
         device: Optional[str] = None,
@@ -35,7 +64,11 @@ class YoloByteTracker:
         from ultralytics import YOLO
 
         self.model = YOLO(model_name)
-        self.tracker_cfg = tracker_cfg
+        # 기본 ultralytics yaml(new_track=0.25)은 낮은 conf와 안 맞아서 conf에 맞춰 생성
+        if tracker_cfg in ("bytetrack.yaml", "botsort.yaml") or not Path(tracker_cfg).is_file():
+            self.tracker_cfg = _tracker_yaml_for_conf(conf)
+        else:
+            self.tracker_cfg = tracker_cfg
         self.conf = conf
         self.iou = iou
         self.classes = list(classes) if classes is not None else None

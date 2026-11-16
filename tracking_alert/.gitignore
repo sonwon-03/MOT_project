@@ -3,6 +3,14 @@ __pycache__/
 .venv/
 venv/
 outputs/
+user_settings.json
+eval_data/**/*.mp4
+eval_data/**/*.avi
+eval_data/**/*.mov
+video_library/**/*.mp4
+video_library/**/*.avi
+video_library/**/*.mov
+configs/bytetrack_conf*.yaml
 *.pt
 *.onnx
 *.mp4

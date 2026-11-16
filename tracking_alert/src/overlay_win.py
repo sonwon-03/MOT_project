@@ -10,6 +10,13 @@ import numpy as np
 from src.event_detector import SuspectEvent
 from src.motion import MotionState
 from src.tracker import TrackedObject
+from src.visualize import (
+    ALERT_BGR,
+    NORMAL_BGR,
+    PREDICT_BGR,
+    VELOCITY_BGR,
+    draw_legend_bar,
+)
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -246,6 +253,7 @@ class ScreenOverlay:
         toggles: dict,
         scale_x: float,
         scale_y: float,
+        predicted=None,
     ) -> None:
         bgra = _render_bgra(
             self.width,
@@ -257,6 +265,7 @@ class ScreenOverlay:
             toggles,
             scale_x,
             scale_y,
+            predicted=predicted,
         )
         self._update(bgra)
         self._pump()
@@ -392,6 +401,24 @@ class ScreenOverlay:
             user32.DispatchMessageW(ctypes.byref(msg))
 
 
+def _draw_dashed_rect(
+    img: np.ndarray,
+    pt1: tuple[int, int],
+    pt2: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 2,
+    gap: int = 10,
+) -> None:
+    x1, y1 = pt1
+    x2, y2 = pt2
+    for x in range(x1, x2, gap * 2):
+        cv2.line(img, (x, y1), (min(x + gap, x2), y1), color, thickness)
+        cv2.line(img, (x, y2), (min(x + gap, x2), y2), color, thickness)
+    for y in range(y1, y2, gap * 2):
+        cv2.line(img, (x1, y), (x1, min(y + gap, y2)), color, thickness)
+        cv2.line(img, (x2, y), (x2, min(y + gap, y2)), color, thickness)
+
+
 def _render_bgra(
     width: int,
     height: int,
@@ -402,6 +429,7 @@ def _render_bgra(
     toggles: dict,
     scale_x: float,
     scale_y: float,
+    predicted=None,
 ) -> np.ndarray:
     canvas = np.zeros((height, width, 3), dtype=np.uint8)
     thick = max(2, int(round(min(scale_x, scale_y))))
@@ -417,15 +445,19 @@ def _render_bgra(
 
     for obj in tracked:
         x1, y1, x2, y2 = obj.bbox_xyxy
-        color = (0, 0, 255) if obj.track_id in alert_ids else (60, 220, 60)
-        cv2.rectangle(canvas, (px(x1), py(y1)), (px(x2), py(y2)), color, thick)
+        is_alert = obj.track_id in alert_ids
+        color = ALERT_BGR if is_alert else NORMAL_BGR
+        box_thick = thick + 2 if is_alert else thick
+        cv2.rectangle(canvas, (px(x1), py(y1)), (px(x2), py(y2)), color, box_thick)
         st = states.get(obj.track_id)
         label = f"ID {obj.track_id} {obj.label}"
+        if is_alert:
+            label = "ALERT " + label
         if st is not None:
             label += f" v={st.speed:.1f} a={st.accel_mag:.1f}"
             p1 = (px(st.x), py(st.y))
             p2 = (px(st.x + st.vx * 5), py(st.y + st.vy * 5))
-            cv2.arrowedLine(canvas, p1, p2, (255, 180, 0), thick, tipLength=0.3)
+            cv2.arrowedLine(canvas, p1, p2, VELOCITY_BGR, thick, tipLength=0.3)
         cv2.putText(
             canvas,
             label,
@@ -437,10 +469,29 @@ def _render_bgra(
             cv2.LINE_AA,
         )
 
+    for obj in predicted or []:
+        x1, y1, x2, y2 = obj.bbox_xyxy
+        color = PREDICT_BGR
+        _draw_dashed_rect(canvas, (px(x1), py(y1)), (px(x2), py(y2)), color, max(2, thick))
+        remain = max(0, obj.hold_frames - obj.missing_frames)
+        label = f"ID {obj.track_id} PREDICT ({remain}f)"
+        cv2.putText(
+            canvas,
+            label,
+            (px(x1), max(24, py(y1) - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font,
+            color,
+            max(1, thick - 1),
+            cv2.LINE_AA,
+        )
+
+    hold = toggles.get("occlusion_hold_sec", 0)
     lines = [
         "F1 accel: " + ("ON" if toggles.get("use_accel_spike") else "OFF"),
         "F2 confirm: " + ("ON" if toggles.get("use_post_state_confirm") else "OFF"),
         "F3 proximity: " + ("ON" if toggles.get("use_proximity_tag") else "OFF"),
+        f"occlusion: {hold}s",
         "F9 quit | F12 save",
     ]
     for i, text in enumerate(lines):
@@ -455,15 +506,17 @@ def _render_bgra(
             cv2.LINE_AA,
         )
 
+    legend_h = draw_legend_bar(canvas, y_bottom=height, scale=max(1.0, font))
     if recent_alerts:
         latest = recent_alerts[-1]
         msg = f"ALERT ID={latest.track_id} {latest.tag} frame={latest.frame_idx}"
         bar_h = max(48, int(36 * font))
-        cv2.rectangle(canvas, (0, height - bar_h), (width, height), (0, 0, 200), -1)
+        y1 = height - legend_h - bar_h
+        cv2.rectangle(canvas, (0, y1), (width, height - legend_h), ALERT_BGR, -1)
         cv2.putText(
             canvas,
             msg,
-            (16, height - bar_h // 3),
+            (16, y1 + bar_h // 2 + 6),
             cv2.FONT_HERSHEY_SIMPLEX,
             font,
             (255, 255, 255),
@@ -472,8 +525,10 @@ def _render_bgra(
         )
 
     for ev in events:
-        cv2.circle(canvas, (px(ev.x), py(ev.y)), max(18, thick * 8), (0, 0, 255), thick)
+        cv2.circle(canvas, (px(ev.x), py(ev.y)), max(18, thick * 8), ALERT_BGR, thick)
 
+    # Windows layered DIB = BGRA. OpenCV 캔버스도 BGR이므로 그대로 쓴다.
+    # (BGR→RGB 변환 시 빨강이 파랑으로 보인다)
     alpha = np.where(canvas.max(axis=2) > 12, 230, 0).astype(np.uint8)
     premul = (canvas.astype(np.float32) * (alpha.astype(np.float32) / 255.0)[..., None])
     bgra = np.dstack([premul.astype(np.uint8), alpha])

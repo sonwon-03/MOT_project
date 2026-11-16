@@ -18,6 +18,7 @@ from config import AppConfig, EventConfig
 from src.event_detector import AccidentSuspectDetector
 from src.event_logger import EventLogger
 from src.motion import MotionEstimator
+from src.occlusion import OcclusionPredictor
 from src.synthetic import generate_collision_scene
 from src.visualize import draw_overlay
 
@@ -34,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default="yolov8n.pt")
     p.add_argument("--device", default=None)
     p.add_argument("--output", default="outputs")
-    p.add_argument("--conf", type=float, default=0.35)
+    p.add_argument("--conf", type=float, default=0.05)
     p.add_argument("--no-show", action="store_true")
     p.add_argument("--save-video", action="store_true")
     p.add_argument(
@@ -138,6 +139,10 @@ def run_tracked_stream(
     )
     motion = MotionEstimator(ema_alpha=cfg.event.ema_alpha)
     detector = AccidentSuspectDetector(cfg.event)
+    occlusion = OcclusionPredictor(
+        hold_seconds=cfg.occlusion_hold_sec,
+        fps_hint=fps_hint,
+    )
     logger = EventLogger(cfg.output_dir)
     recent = deque(maxlen=8)
 
@@ -155,7 +160,10 @@ def run_tracked_stream(
         tracked = tracker.track_frame(frame)
         dets = [(o.track_id, *o.center) for o in tracked]
         states = motion.update(frame_idx, dets)
-        events = detector.update(frame_idx, states)
+        bboxes = {o.track_id: tuple(map(float, o.bbox_xyxy)) for o in tracked}
+        # 사고 판정은 실제 검출만 사용. 가림 예측은 표시 전용.
+        events = detector.update(frame_idx, states, bboxes=bboxes)
+        predicted = occlusion.update(frame_idx, tracked, states)
         if events:
             logger.log(events)
             recent.extend(events)
@@ -172,8 +180,11 @@ def run_tracked_stream(
             "use_accel_spike": cfg.event.use_accel_spike,
             "use_post_state_confirm": cfg.event.use_post_state_confirm,
             "use_proximity_tag": cfg.event.use_proximity_tag,
+            "occlusion_hold_sec": cfg.occlusion_hold_sec,
         }
-        vis = draw_overlay(frame, tracked, states, events, list(recent), toggles)
+        vis = draw_overlay(
+            frame, tracked, states, events, list(recent), toggles, predicted=predicted
+        )
 
         if save_video:
             if writer is None:
@@ -188,7 +199,9 @@ def run_tracked_stream(
 
         if on_visual is not None:
             fh, fw = frame.shape[:2]
-            on_visual(tracked, states, events, list(recent), toggles, fw, fh, vis)
+            on_visual(
+                tracked, states, events, list(recent), toggles, fw, fh, vis, predicted
+            )
 
         if overlay is not None:
             fh, fw = frame.shape[:2]
@@ -200,6 +213,7 @@ def run_tracked_stream(
                 toggles,
                 scale_x=overlay.width / max(fw, 1),
                 scale_y=overlay.height / max(fh, 1),
+                predicted=predicted,
             )
             quit_loop = False
             for key_name in overlay.poll_keys():
@@ -236,7 +250,8 @@ def run_synthetic(cfg: AppConfig, show: bool, save_video: bool) -> None:
     for frame_idx, (frame, tracked) in enumerate(generate_collision_scene()):
         dets = [(o.track_id, *o.center) for o in tracked]
         states = motion.update(frame_idx, dets)
-        events = detector.update(frame_idx, states)
+        bboxes = {o.track_id: tuple(map(float, o.bbox_xyxy)) for o in tracked}
+        events = detector.update(frame_idx, states, bboxes=bboxes)
         if events:
             logger.log(events)
             recent.extend(events)
@@ -280,13 +295,23 @@ def run_synthetic(cfg: AppConfig, show: bool, save_video: bool) -> None:
     print(f"[done] events={len(detector.events)} log={logger.csv_path}")
 
 
-def run_video(cfg: AppConfig, source: str, show: bool, save_video: bool) -> None:
+def run_video(
+    cfg: AppConfig,
+    source: str,
+    show: bool,
+    save_video: bool,
+    stop_event=None,
+    on_alert: Callable | None = None,
+    on_visual: Callable | None = None,
+    out_name: str = "tracked_alert.mp4",
+) -> Path | None:
     cap_source: str | int = 0 if source == "webcam" else source
     cap = cv2.VideoCapture(cap_source)
     if not cap.isOpened():
         raise RuntimeError(f"영상을 열 수 없습니다: {source}")
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    out_path = Path(cfg.output_dir) / out_name if save_video else None
 
     def frame_iter() -> Optional[np.ndarray]:
         ok, frame = cap.read()
@@ -298,12 +323,18 @@ def run_video(cfg: AppConfig, source: str, show: bool, save_video: bool) -> None
             frame_iter=frame_iter,
             show=show,
             save_video=save_video,
-            out_name="tracked_alert.mp4",
+            out_name=out_name,
             wait_ms=1,
             fps_hint=float(fps),
+            stop_event=stop_event,
+            on_alert=on_alert,
+            on_visual=on_visual,
         )
     finally:
         cap.release()
+    if out_path is not None and out_path.exists():
+        return out_path
+    return None
 
 
 def run_screen(
