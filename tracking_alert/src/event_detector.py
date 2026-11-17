@@ -28,7 +28,7 @@ class AccidentSuspectDetector:
     움직이던 객체가 속도를 크게 잃은 뒤 그 상태가 유지되면 사고 의심으로 본다.
 
     정지 객체의 박스 흔들림은 가속도만 크고 직전 속도가 낮아서 제외한다.
-    코너 선회처럼 방향만 바뀌고 속도가 유지되는 경우도 제외한다.
+    코너 선회 제외 필터는 쓰지 않는다. (박스 크기 원근 보정으로 전진/선회 속도 구분)
     정면충돌 직후 추적이 잠깐 끊겨도 후보를 바로 버리지 않는다.
     """
 
@@ -38,9 +38,6 @@ class AccidentSuspectDetector:
         self._cooldown_until: Dict[int, int] = {}
         self._speed_hist: Dict[int, Deque[float]] = defaultdict(
             lambda: deque(maxlen=max(cfg.baseline_frames * 2, 12))
-        )
-        self._vel_hist: Dict[int, Deque[tuple[float, float]]] = defaultdict(
-            lambda: deque(maxlen=8)
         )
         self._bboxes: Dict[int, tuple[float, float, float, float]] = {}
         self._last_states: Dict[int, MotionState] = {}
@@ -52,7 +49,6 @@ class AccidentSuspectDetector:
         self._pending.clear()
         self._cooldown_until.clear()
         self._speed_hist.clear()
-        self._vel_hist.clear()
         self._bboxes.clear()
         self._last_states.clear()
         self._last_bboxes.clear()
@@ -127,13 +123,8 @@ class AccidentSuspectDetector:
         for tid in list(self._speed_hist.keys()):
             if tid not in alive_ids and tid not in self._pending:
                 del self._speed_hist[tid]
-        for tid in list(self._vel_hist.keys()):
-            if tid not in alive_ids and tid not in self._pending:
-                del self._vel_hist[tid]
 
         for tid, st in states.items():
-            self._vel_hist[tid].append((st.vx, st.vy))
-
             if st.age < self.cfg.min_track_age:
                 self._speed_hist[tid].append(st.speed)
                 continue
@@ -159,8 +150,6 @@ class AccidentSuspectDetector:
 
             baseline = self._baseline_speed(tid)
             self._speed_hist[tid].append(st.speed)
-            if self._is_likely_turn(tid, st, baseline):
-                continue
             if not self._is_crash_drop(st, baseline):
                 continue
 
@@ -275,11 +264,6 @@ class AccidentSuspectDetector:
         pending = self._pending[st.track_id]
         pending["peak_accel"] = max(pending["peak_accel"], st.accel_mag)
 
-        # 급격한 방향 반전(정면충돌)은 선회가 아님. 완만한 선회만 폐기.
-        if self._is_likely_turn(st.track_id, st, pending["pre_speed"]):
-            self._pending.pop(st.track_id, None)
-            return None
-
         if self._is_post_state_stable(st, pending):
             pending["stable_count"] += 1
         else:
@@ -312,57 +296,6 @@ class AccidentSuspectDetector:
             return None
         vals = sorted(list(hist)[-self.cfg.baseline_frames :])
         return vals[len(vals) // 2]
-
-    def _heading_steps_deg(self, track_id: int) -> list[float]:
-        hist = list(self._vel_hist.get(track_id, []))
-        angles: list[float] = []
-        for vx, vy in hist:
-            if math.hypot(vx, vy) < 1.0:
-                continue
-            angles.append(math.atan2(vy, vx))
-        if len(angles) < 3:
-            return []
-        steps: list[float] = []
-        for a0, a1 in zip(angles, angles[1:]):
-            d = a1 - a0
-            while d > math.pi:
-                d -= 2.0 * math.pi
-            while d < -math.pi:
-                d += 2.0 * math.pi
-            steps.append(math.degrees(d))
-        return steps
-
-    def _heading_change_deg(self, track_id: int) -> float:
-        steps = self._heading_steps_deg(track_id)
-        if not steps:
-            return 0.0
-        return abs(sum(steps))
-
-    def _is_likely_turn(
-        self, track_id: int, st: MotionState, baseline: Optional[float]
-    ) -> bool:
-        """완만히 헤딩이 바뀌고 속도가 유지되면 코너 선회. 급반전은 충돌로 본다."""
-        if baseline is None or baseline < self.cfg.min_move_speed * 0.8:
-            return False
-        keep = float(self.cfg.turn_speed_keep_ratio)
-        if st.speed < baseline * keep:
-            return False
-        if st.speed < self.cfg.stop_speed * 2.0:
-            return False
-        steps = self._heading_steps_deg(track_id)
-        if len(steps) < 2:
-            return False
-        max_step = max(abs(s) for s in steps)
-        # 한 프레임에 크게 뒤집히면 정면충돌/튕김
-        if max_step >= 55.0:
-            return False
-        total = abs(sum(steps))
-        if total < float(self.cfg.turn_heading_deg):
-            return False
-        # 거의 유턴 수준은 선회 필터로 막지 않음
-        if total >= 120.0:
-            return False
-        return True
 
     def _is_crash_drop(self, st: MotionState, baseline: Optional[float]) -> bool:
         if baseline is None or baseline < self.cfg.min_move_speed:

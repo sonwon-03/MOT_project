@@ -116,8 +116,18 @@ def draw_overlay(
 ) -> np.ndarray:
     out = frame.copy()
     alert_ids = {ev.track_id for ev in recent_alerts}
+    tracked_list = list(tracked)
+    # 박스 과다 시 그리기 비용 제한 (알림 대상은 항상 표시)
+    if len(tracked_list) > 80:
+        alerts = [o for o in tracked_list if o.track_id in alert_ids]
+        others = sorted(
+            (o for o in tracked_list if o.track_id not in alert_ids),
+            key=lambda o: o.conf,
+            reverse=True,
+        )
+        tracked_list = alerts + others[: max(0, 80 - len(alerts))]
 
-    for obj in tracked:
+    for obj in tracked_list:
         x1, y1, x2, y2 = map(int, obj.bbox_xyxy)
         st = states.get(obj.track_id)
         is_alert = obj.track_id in alert_ids
@@ -125,6 +135,9 @@ def draw_overlay(
         thickness = 3 if is_alert else 2
 
         cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+        # 저신뢰 박스는 사각형만 (텍스트/화살표 생략 → 속도↑)
+        if not is_alert and obj.conf < 0.15:
+            continue
         label = f"ID {obj.track_id} {obj.label}"
         if is_alert:
             label = "ALERT " + label

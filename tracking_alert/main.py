@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 from config import AppConfig, EventConfig
 from src.event_detector import AccidentSuspectDetector
 from src.event_logger import EventLogger
-from src.motion import MotionEstimator
+from src.motion import MotionEstimator, bbox_scale
 from src.occlusion import OcclusionPredictor
 from src.synthetic import generate_collision_scene
 from src.visualize import draw_overlay
@@ -190,7 +190,9 @@ def run_tracked_stream(
             break
 
         tracked = tracker.track_frame(frame)
-        dets = [(o.track_id, *o.center) for o in tracked]
+        dets = [
+            (o.track_id, *o.center, bbox_scale(o.bbox_xyxy)) for o in tracked
+        ]
         states = motion.update(frame_idx, dets)
         bboxes = {o.track_id: tuple(map(float, o.bbox_xyxy)) for o in tracked}
         # 사고 판정은 실제 검출만 사용. 가림 예측은 표시 전용.
@@ -285,7 +287,9 @@ def run_synthetic(cfg: AppConfig, show: bool, save_video: bool) -> None:
     out_path = Path(cfg.output_dir) / "synthetic_demo.mp4"
 
     for frame_idx, (frame, tracked) in enumerate(generate_collision_scene()):
-        dets = [(o.track_id, *o.center) for o in tracked]
+        dets = [
+            (o.track_id, *o.center, bbox_scale(o.bbox_xyxy)) for o in tracked
+        ]
         states = motion.update(frame_idx, dets)
         bboxes = {o.track_id: tuple(map(float, o.bbox_xyxy)) for o in tracked}
         events = detector.update(

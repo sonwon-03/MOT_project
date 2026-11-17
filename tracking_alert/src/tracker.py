@@ -29,19 +29,22 @@ class TrackedObject:
 
 def _tracker_yaml_for_conf(conf: float) -> str:
     """YOLO conf보다 높은 new_track_thresh 때문에 약한 검출이 버려지지 않게 맞춤."""
-    conf = float(max(0.001, min(0.9, conf)))
+    conf = float(max(1e-12, min(0.9, conf)))
     high = conf
-    low = max(0.01, conf * 0.5)
+    # 예전엔 low 하한이 0.01이라 conf를 더 내려도 추적기가 막혔다.
+    low = max(1e-12, conf * 0.5)
     new = conf
     _CONFIGS.mkdir(parents=True, exist_ok=True)
-    path = _CONFIGS / f"bytetrack_conf{conf:.2f}.yaml"
+    # 파일명에 지수 표기 쓰면 충돌 나니 고정 자리수 사용
+    tag = f"{conf:.12f}".rstrip("0").rstrip(".")
+    path = _CONFIGS / f"bytetrack_conf{tag}.yaml"
     path.write_text(
         "\n".join(
             [
                 "tracker_type: bytetrack",
-                f"track_high_thresh: {high:.3f}",
-                f"track_low_thresh: {low:.3f}",
-                f"new_track_thresh: {new:.3f}",
+                f"track_high_thresh: {high:.12f}",
+                f"track_low_thresh: {low:.12f}",
+                f"new_track_thresh: {new:.12f}",
                 "track_buffer: 60",
                 "match_thresh: 0.7",
                 "fuse_score: True",
@@ -93,12 +96,16 @@ class YoloByteTracker:
             self.tracker_cfg = _tracker_yaml_for_conf(conf)
         else:
             self.tracker_cfg = tracker_cfg
-        self.conf = conf
+        self.conf = float(conf)
         self.iou = iou
         self.classes = list(classes) if classes is not None else None
         self.device = device
         self.small_object_boost = bool(small_object_boost)
         self.imgsz = _round_imgsz(imgsz)
+        # 300은 저conf에서 부족, 3000은 재생이 너무 느림 → 타협
+        self.max_det = 500
+        # 추적/판정에 쓸 상위 박스 수 (그리기·속도계산 부하 제한)
+        self.keep_top = 120
         self.names = self.model.names
         self._fallback: dict[int, tuple[float, float, float, float]] = {}
         self._next_fb_id = 10000
@@ -132,11 +139,12 @@ class YoloByteTracker:
                 source=view,
                 persist=True,
                 tracker=self.tracker_cfg,
-                conf=self.conf,
+                conf=float(self.conf),
                 iou=self.iou,
                 classes=self.classes,
                 device=self.device,
                 imgsz=imgsz,
+                max_det=int(self.max_det),
                 verbose=False,
             )
         if not results:
@@ -154,8 +162,23 @@ class YoloByteTracker:
         confs = r0.boxes.conf.cpu().numpy()
         clss = r0.boxes.cls.cpu().numpy().astype(int)
 
+        # 너무 작은 노이즈 박스 제거
+        wh = np.maximum(boxes[:, 2:4] - boxes[:, 0:2], 0.0)
+        area = wh[:, 0] * wh[:, 1]
+        keep = area >= 64.0  # 약 8x8 이상
+        boxes, confs, clss = boxes[keep], confs[keep], clss[keep]
+        ids = None
         if r0.boxes.id is not None:
-            ids = r0.boxes.id.cpu().numpy().astype(int)
+            ids = r0.boxes.id.cpu().numpy().astype(int)[keep]
+
+        # 점수 높은 순으로 상위만 사용 (재생 속도 유지)
+        if len(confs) > self.keep_top:
+            order = np.argsort(-confs)[: self.keep_top]
+            boxes, confs, clss = boxes[order], confs[order], clss[order]
+            if ids is not None:
+                ids = ids[order]
+
+        if ids is not None:
             tracked: list[TrackedObject] = []
             self._fallback.clear()
             for bbox, tid, conf, cls_id in zip(boxes, ids, confs, clss):

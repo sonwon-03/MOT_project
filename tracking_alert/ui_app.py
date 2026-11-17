@@ -1103,8 +1103,8 @@ class StudioApp:
 
         saved = (self._settings or {}).get(prefix, {})
         label("사고 판정 민감도")
-        sens = tk.IntVar(value=int(saved.get("sensitivity", 3)))
-        conf = tk.DoubleVar(value=float(saved.get("conf", 0.05)))
+        sens = tk.DoubleVar(value=float(saved.get("sensitivity", 3)))
+        conf = tk.DoubleVar(value=float(saved.get("conf", 0.01)))
         occ_on = tk.BooleanVar(
             value=bool(saved.get("occlusion", saved.get("occlusion_sec", 1.0) > 0))
         )
@@ -1123,9 +1123,9 @@ class StudioApp:
 
         tk.Scale(
             parent,
-            from_=1,
+            from_=0.5,
             to=5,
-            resolution=1,
+            resolution=0.5,
             orient="horizontal",
             variable=sens,
             bg=panel,
@@ -1135,7 +1135,7 @@ class StudioApp:
         ).pack(fill="x", padx=14)
         tk.Label(
             parent,
-            text="1 둔감    ·    5 민감",
+            text="0.5 매우 둔감  ·  1  ·  1.5  ·  …  ·  5 민감",
             bg=panel,
             fg="#9aa3b2",
             font=("Malgun Gothic", 9),
@@ -1144,13 +1144,53 @@ class StudioApp:
         label("검출 신뢰도")
         conf_row = tk.Frame(parent, bg=panel)
         conf_row.pack(fill="x", padx=14)
+        # 저화질·소형 차량용으로 왼쪽을 극저 conf까지 열고, 가운데≈0.01
+        conf_min, conf_mid, conf_max = 1e-12, 0.01, 0.8
+
+        def _clamp_conf(value: float) -> float:
+            return float(max(conf_min, min(conf_max, value)))
+
+        def _conf_to_pos(value: float) -> float:
+            import math
+
+            v = _clamp_conf(value)
+            if v <= conf_mid:
+                t = (math.log(v) - math.log(conf_min)) / (
+                    math.log(conf_mid) - math.log(conf_min)
+                )
+                return 50.0 * max(0.0, min(1.0, t))
+            t = (math.log(v) - math.log(conf_mid)) / (
+                math.log(conf_max) - math.log(conf_mid)
+            )
+            return 50.0 + 50.0 * max(0.0, min(1.0, t))
+
+        def _pos_to_conf(pos: float) -> float:
+            import math
+
+            p = float(max(0.0, min(100.0, pos)))
+            if p <= 50.0:
+                t = p / 50.0
+                return float(
+                    math.exp(
+                        math.log(conf_min)
+                        + t * (math.log(conf_mid) - math.log(conf_min))
+                    )
+                )
+            t = (p - 50.0) / 50.0
+            return float(
+                math.exp(
+                    math.log(conf_mid) + t * (math.log(conf_max) - math.log(conf_mid))
+                )
+            )
+
+        conf_pos = tk.DoubleVar(value=_conf_to_pos(float(conf.get())))
         conf_scale = tk.Scale(
             conf_row,
-            from_=0.001,
-            to=0.8,
-            resolution=0.001,
+            from_=0,
+            to=100,
+            resolution=0.5,
             orient="horizontal",
-            variable=conf,
+            variable=conf_pos,
             bg=panel,
             fg=fg,
             highlightthickness=0,
@@ -1160,7 +1200,7 @@ class StudioApp:
         conf_scale.pack(side="left", fill="x", expand=True)
         conf_entry = tk.Entry(
             conf_row,
-            width=7,
+            width=8,
             bg="#101216",
             fg=fg,
             insertbackground=fg,
@@ -1169,19 +1209,48 @@ class StudioApp:
             justify="center",
         )
         conf_entry.pack(side="right", padx=(8, 0))
-        conf_entry.insert(0, f"{float(conf.get()):.3f}")
 
-        def _clamp_conf(value: float) -> float:
-            return float(max(0.001, min(0.8, value)))
+        def _fmt_conf(value: float) -> str:
+            v = _clamp_conf(value)
+            if v < 1e-4:
+                return f"{v:.9f}".rstrip("0").rstrip(".") or "0"
+            if v < 0.001:
+                return f"{v:.6f}"
+            if v < 0.01:
+                return f"{v:.4f}"
+            return f"{v:.3f}"
+
+        conf_entry.insert(0, _fmt_conf(float(conf.get())))
+        _conf_ui_lock = {"busy": False}
 
         def _sync_conf_entry(*_args) -> None:
             try:
-                text = f"{_clamp_conf(float(conf.get())):.3f}"
+                text = _fmt_conf(float(conf.get()))
             except Exception:
                 return
             if conf_entry.get() != text:
                 conf_entry.delete(0, "end")
                 conf_entry.insert(0, text)
+
+        def _on_conf_pos(_value=None) -> None:
+            if _conf_ui_lock["busy"]:
+                return
+            _conf_ui_lock["busy"] = True
+            try:
+                conf.set(_clamp_conf(_pos_to_conf(float(conf_pos.get()))))
+                _sync_conf_entry()
+            finally:
+                _conf_ui_lock["busy"] = False
+
+        def _on_conf_var(*_args) -> None:
+            if _conf_ui_lock["busy"]:
+                return
+            _conf_ui_lock["busy"] = True
+            try:
+                conf_pos.set(_conf_to_pos(float(conf.get())))
+                _sync_conf_entry()
+            finally:
+                _conf_ui_lock["busy"] = False
 
         def _apply_conf_entry(_event=None) -> None:
             raw = conf_entry.get().strip().replace(",", ".")
@@ -1191,17 +1260,25 @@ class StudioApp:
                 _sync_conf_entry()
                 return
             conf.set(value)
-            _sync_conf_entry()
+            _on_conf_var()
 
-        conf.trace_add("write", lambda *_: _sync_conf_entry())
+        conf_scale.configure(command=_on_conf_pos)
+        conf.trace_add("write", lambda *_: _on_conf_var())
         conf_entry.bind("<Return>", _apply_conf_entry)
         conf_entry.bind("<FocusOut>", _apply_conf_entry)
         tk.Label(
             parent,
-            text="슬라이더 또는 직접 입력  ·  0.001~0.8  ·  낮출수록 더 많이 잡힘",
+            text="왼쪽 최대검출(1e-12)  ·  가운데≈0.01  ·  오른쪽 엄격(0.8)",
             bg=panel,
             fg="#9aa3b2",
             font=("Malgun Gothic", 9),
+        ).pack(anchor="w", padx=14)
+        tk.Label(
+            parent,
+            text="※ 값 바꾼 뒤 추적 다시 시작  ·  너무 낮추면 잡음만 늘 수 있음",
+            bg=panel,
+            fg="#9aa3b2",
+            font=("Malgun Gothic", 8),
         ).pack(anchor="w", padx=14)
 
         tk.Checkbutton(
@@ -1305,7 +1382,7 @@ class StudioApp:
         return {
             "cap": {
                 "sensitivity": 3,
-                "conf": 0.05,
+                "conf": 0.01,
                 "occlusion": True,
                 "occlusion_sec": 1.0,
                 "small_object_boost": True,
@@ -1316,7 +1393,7 @@ class StudioApp:
             },
             "eval": {
                 "sensitivity": 3,
-                "conf": 0.05,
+                "conf": 0.01,
                 "occlusion": True,
                 "occlusion_sec": 1.0,
                 "small_object_boost": True,
@@ -1354,7 +1431,7 @@ class StudioApp:
         data = self._default_settings()
         if hasattr(self, "sensitivity_var"):
             data["cap"] = {
-                "sensitivity": int(self.sensitivity_var.get()),
+                "sensitivity": float(self.sensitivity_var.get()),
                 "conf": float(self.conf_var.get()),
                 "occlusion": bool(self.occlusion_var.get()),
                 "occlusion_sec": float(self.occlusion_sec_var.get()),
@@ -1366,7 +1443,7 @@ class StudioApp:
             }
         if hasattr(self, "eval_sensitivity_var"):
             data["eval"] = {
-                "sensitivity": int(self.eval_sensitivity_var.get()),
+                "sensitivity": float(self.eval_sensitivity_var.get()),
                 "conf": float(self.eval_conf_var.get()),
                 "occlusion": bool(self.eval_occlusion_var.get()),
                 "occlusion_sec": float(self.eval_occlusion_sec_var.get()),
@@ -1421,8 +1498,8 @@ class StudioApp:
         for key in targets:
             block = data.get(key) or {}
             if key == "cap" and hasattr(self, "sensitivity_var"):
-                self.sensitivity_var.set(int(block.get("sensitivity", 3)))
-                self.conf_var.set(float(block.get("conf", 0.05)))
+                self.sensitivity_var.set(float(block.get("sensitivity", 3)))
+                self.conf_var.set(float(block.get("conf", 0.01)))
                 occ_sec = float(block.get("occlusion_sec", 1.0))
                 self.occlusion_var.set(
                     bool(block.get("occlusion", occ_sec > 0))
@@ -1436,8 +1513,8 @@ class StudioApp:
                 self.confirm_var.set(bool(block.get("confirm", True)))
                 self.prox_var.set(bool(block.get("prox", True)))
             if key == "eval" and hasattr(self, "eval_sensitivity_var"):
-                self.eval_sensitivity_var.set(int(block.get("sensitivity", 3)))
-                self.eval_conf_var.set(float(block.get("conf", 0.05)))
+                self.eval_sensitivity_var.set(float(block.get("sensitivity", 3)))
+                self.eval_conf_var.set(float(block.get("conf", 0.01)))
                 occ_sec = float(block.get("occlusion_sec", 1.0))
                 self.eval_occlusion_var.set(
                     bool(block.get("occlusion", occ_sec > 0))
@@ -1874,7 +1951,7 @@ class StudioApp:
 
     def _make_cfg_from(
         self,
-        sensitivity: int,
+        sensitivity: float,
         conf: float,
         occlusion_sec: float,
         spike: bool,
@@ -1885,7 +1962,7 @@ class StudioApp:
         output_dir: str = "outputs",
     ) -> AppConfig:
         cfg = AppConfig(
-            conf=float(max(0.001, min(0.8, conf))),
+            conf=float(max(1e-12, min(0.8, conf))),
             output_dir=output_dir,
             occlusion_hold_sec=occlusion_sec,
             small_object_boost=small_object_boost,
@@ -1897,7 +1974,7 @@ class StudioApp:
                 use_proximity_tag=prox,
             ),
         )
-        cfg.event.apply_sensitivity(sensitivity)
+        cfg.event.apply_sensitivity(float(sensitivity))
         return cfg
 
     def _occlusion_hold_from_ui(self, *, eval_mode: bool = False) -> float:
@@ -1911,7 +1988,7 @@ class StudioApp:
 
     def _make_cfg(self) -> AppConfig:
         return self._make_cfg_from(
-            int(self.sensitivity_var.get()),
+            float(self.sensitivity_var.get()),
             float(self.conf_var.get()),
             self._occlusion_hold_from_ui(eval_mode=False),
             bool(self.spike_var.get()),
@@ -1923,7 +2000,7 @@ class StudioApp:
 
     def _make_eval_cfg(self) -> AppConfig:
         return self._make_cfg_from(
-            int(self.eval_sensitivity_var.get()),
+            float(self.eval_sensitivity_var.get()),
             float(self.eval_conf_var.get()),
             self._occlusion_hold_from_ui(eval_mode=True),
             bool(self.eval_spike_var.get()),
@@ -2128,6 +2205,12 @@ class StudioApp:
         self.monitor_box.configure(state="disabled")
         self.preview_title.configure(text="추적 중 · 결과 녹화")
         self._set_status("모델 준비 중", "#f0b429")
+        if hasattr(self, "log"):
+            self.log.insert(
+                0,
+                f"적용 conf={cfg.conf:g}  imgsz={cfg.imgsz}  "
+                f"small_boost={cfg.small_object_boost}",
+            )
 
         mon = self._selected_monitor()
         if use_screen:
@@ -2331,7 +2414,7 @@ class StudioApp:
         if workers > 1:
             cfg.small_object_boost = False
             cfg.imgsz = 960
-        sensitivity = int(self.eval_sensitivity_var.get())
+        sensitivity = float(self.eval_sensitivity_var.get())
         conf = float(self.eval_conf_var.get())
         jobs = [("accident", p) for p in accident] + [
             ("normal", p) for p in normal
@@ -2943,8 +3026,8 @@ class StudioApp:
         if visual is None:
             return
         now = time.perf_counter()
-        # 미리보기 과도 갱신(PNG 시절)이 추적을 더 끊기게 만들어 초당 ~12회로 제한
-        paint_ui = now - self._last_capture_paint >= 0.08
+        # 미리보기 과도 갱신이 재생을 느리게 만들어 초당 ~8회로 제한
+        paint_ui = now - self._last_capture_paint >= 0.12
         tracked, states, events, recent, toggles, fw, fh, vis, predicted = visual
         pred_n = len(predicted) if predicted is not None else 0
         if paint_ui and hasattr(self, "preview_title"):

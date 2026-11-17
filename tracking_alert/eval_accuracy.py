@@ -32,7 +32,7 @@ if str(ROOT) not in sys.path:
 
 from config import AppConfig, EventConfig
 from src.event_detector import AccidentSuspectDetector, SuspectEvent
-from src.motion import MotionEstimator
+from src.motion import MotionEstimator, bbox_scale
 from src.occlusion import OcclusionPredictor
 from src.tracker import YoloByteTracker
 from src.visualize import draw_overlay
@@ -139,7 +139,9 @@ def evaluate_video(
         if max_frames is not None and frame_idx >= max_frames:
             break
         tracked = tracker.track_frame(frame)
-        dets = [(o.track_id, *o.center) for o in tracked]
+        dets = [
+            (o.track_id, *o.center, bbox_scale(o.bbox_xyxy)) for o in tracked
+        ]
         states = motion.update(frame_idx, dets)
         bboxes = {o.track_id: tuple(map(float, o.bbox_xyxy)) for o in tracked}
         fired = detector.update(

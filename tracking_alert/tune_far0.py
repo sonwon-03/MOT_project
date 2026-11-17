@@ -23,7 +23,7 @@ if str(ROOT) not in sys.path:
 from config import AppConfig, EventConfig
 from eval_accuracy import VideoResult, default_workers, list_videos, summarize
 from src.event_detector import AccidentSuspectDetector
-from src.motion import MotionEstimator, MotionState
+from src.motion import MotionEstimator, MotionState, bbox_scale
 from src.tracker import YoloByteTracker
 
 CACHE_DIR = ROOT / "outputs" / "tune_cache"
@@ -53,7 +53,9 @@ def extract_motion(video_path: Path, conf: float) -> list[dict[int, dict]]:
         if not ok:
             break
         tracked = tracker.track_frame(frame)
-        dets = [(o.track_id, *o.center) for o in tracked]
+        dets = [
+            (o.track_id, *o.center, bbox_scale(o.bbox_xyxy)) for o in tracked
+        ]
         states = motion.update(frame_idx, dets)
         frames.append(
             {

@@ -38,30 +38,53 @@ class EventConfig:
     # 좌표 스무딩 (0~1, 클수록 이전값 비중↑)
     ema_alpha: float = 0.4
 
-    def apply_sensitivity(self, level: int) -> None:
-        """1은 둔감, 5는 민감. 3이 기본 판정 기준이다."""
-        level = min(5, max(1, int(level)))
+    def apply_sensitivity(self, level: float) -> None:
+        """0.5는 매우 둔감, 5는 민감. 0.5 단위. 3이 기본."""
         # (drop_ratio, min_move_speed, accel_threshold, confirm_frames)
         # 3 = FAR=0 튜닝 최적 근처
         presets = {
-            1: (0.50, 5.0, 8.0, 6),
-            2: (0.35, 4.0, 5.0, 5),
-            3: (0.25, 3.5, 3.0, 4),
-            4: (0.22, 3.0, 2.5, 3),
-            5: (0.20, 2.5, 2.0, 3),
+            0.5: (0.65, 7.0, 12.0, 8.0),
+            1.0: (0.50, 5.0, 8.0, 6.0),
+            1.5: (0.425, 4.5, 6.5, 5.5),
+            2.0: (0.35, 4.0, 5.0, 5.0),
+            2.5: (0.30, 3.75, 4.0, 4.5),
+            3.0: (0.25, 3.5, 3.0, 4.0),
+            3.5: (0.235, 3.25, 2.75, 3.5),
+            4.0: (0.22, 3.0, 2.5, 3.0),
+            4.5: (0.21, 2.75, 2.25, 3.0),
+            5.0: (0.20, 2.5, 2.0, 3.0),
         }
-        drop_ratio, min_move_speed, accel_threshold, confirm_frames = presets[level]
-        self.drop_ratio = drop_ratio
-        self.min_move_speed = min_move_speed
-        self.accel_threshold = accel_threshold
-        self.confirm_frames = confirm_frames
+        keys = sorted(presets)
+        level = float(min(keys[-1], max(keys[0], level)))
+        # 가장 가까운 아래/위 키로 보간
+        lo = keys[0]
+        hi = keys[-1]
+        for k in keys:
+            if k <= level:
+                lo = k
+            if k >= level:
+                hi = k
+                break
+        if abs(hi - lo) < 1e-9:
+            drop_ratio, min_move_speed, accel_threshold, confirm_frames = presets[lo]
+        else:
+            t = (level - lo) / (hi - lo)
+            a, b = presets[lo], presets[hi]
+            drop_ratio = a[0] + t * (b[0] - a[0])
+            min_move_speed = a[1] + t * (b[1] - a[1])
+            accel_threshold = a[2] + t * (b[2] - a[2])
+            confirm_frames = a[3] + t * (b[3] - a[3])
+        self.drop_ratio = float(drop_ratio)
+        self.min_move_speed = float(min_move_speed)
+        self.accel_threshold = float(accel_threshold)
+        self.confirm_frames = max(1, int(round(confirm_frames)))
 
 
 @dataclass
 class AppConfig:
     model_name: str = "yolov8n.pt"
     tracker_cfg: str = "bytetrack.yaml"
-    conf: float = 0.05
+    conf: float = 0.01
     iou: float = 0.5
     classes: tuple[int, ...] = (0, 2, 3, 5, 7)  # person, car, motorcycle, bus, truck
     device: str | None = None
