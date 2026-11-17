@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from collections import deque
 from pathlib import Path
 from typing import Callable, Optional
@@ -121,12 +122,16 @@ def run_tracked_stream(
     save_video: bool,
     out_name: str,
     wait_ms: int = 1,
-    fps_hint: float = 30.0,
+    fps_hint: float = 0.0,
     overlay=None,
     stop_event=None,
     on_alert: Callable | None = None,
     on_visual: Callable | None = None,
 ) -> None:
+    """프레임 수/FPS 상한 없이 들어오는 프레임을 전부 처리한다.
+
+    fps_hint <= 0 이면 실제 처리 속도를 측정해 녹화·가림 타이밍에 쓴다.
+    """
     from src.tracker import YoloByteTracker
 
     tracker = YoloByteTracker(
@@ -136,12 +141,16 @@ def run_tracked_stream(
         iou=cfg.iou,
         classes=cfg.classes,
         device=cfg.device,
+        small_object_boost=cfg.small_object_boost,
+        imgsz=cfg.imgsz,
     )
     motion = MotionEstimator(ema_alpha=cfg.event.ema_alpha)
     detector = AccidentSuspectDetector(cfg.event)
+    # fps_hint>0: 영상 메타 FPS / <=0: 측정 전까지 임시값
+    known_fps = float(fps_hint) if float(fps_hint) > 1.0 else None
     occlusion = OcclusionPredictor(
         hold_seconds=cfg.occlusion_hold_sec,
-        fps_hint=fps_hint,
+        fps_hint=known_fps if known_fps is not None else 30.0,
     )
     logger = EventLogger(cfg.output_dir)
     recent = deque(maxlen=8)
@@ -149,6 +158,29 @@ def run_tracked_stream(
     writer = None
     out_path = Path(cfg.output_dir) / out_name
     frame_idx = 0
+    pending_vis: list[np.ndarray] = []
+    t0 = time.perf_counter()
+    write_fps = known_fps
+
+    def _ensure_writer(sample: np.ndarray) -> None:
+        nonlocal writer, write_fps
+        if writer is not None:
+            return
+        if write_fps is None:
+            elapsed = time.perf_counter() - t0
+            # 하한만 두고 상한(30 등)은 두지 않음
+            write_fps = max(1.0, (frame_idx + 1) / max(elapsed, 1e-3))
+            occlusion.fps_hint = write_fps
+        h, w = sample.shape[:2]
+        writer = cv2.VideoWriter(
+            str(out_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            float(write_fps),
+            (w, h),
+        )
+        for buffered in pending_vis:
+            writer.write(buffered)
+        pending_vis.clear()
 
     while True:
         if stop_event is not None and stop_event.is_set():
@@ -162,12 +194,18 @@ def run_tracked_stream(
         states = motion.update(frame_idx, dets)
         bboxes = {o.track_id: tuple(map(float, o.bbox_xyxy)) for o in tracked}
         # 사고 판정은 실제 검출만 사용. 가림 예측은 표시 전용.
-        events = detector.update(frame_idx, states, bboxes=bboxes)
+        events = detector.update(
+            frame_idx,
+            states,
+            bboxes=bboxes,
+            frame_shape=frame.shape[:2],
+        )
         predicted = occlusion.update(frame_idx, tracked, states)
         if events:
             logger.log(events)
             recent.extend(events)
-            play_alert()
+            if cfg.sound_alert:
+                play_alert()
             for e in events:
                 print(
                     f"[ALERT] frame={e.frame_idx} id={e.track_id} "
@@ -187,15 +225,12 @@ def run_tracked_stream(
         )
 
         if save_video:
-            if writer is None:
-                h, w = vis.shape[:2]
-                writer = cv2.VideoWriter(
-                    str(out_path),
-                    cv2.VideoWriter_fourcc(*"mp4v"),
-                    float(fps_hint),
-                    (w, h),
-                )
-            writer.write(vis)
+            if writer is None and write_fps is None and frame_idx < 12:
+                pending_vis.append(vis)
+            else:
+                _ensure_writer(vis)
+                if writer is not None:
+                    writer.write(vis)
 
         if on_visual is not None:
             fh, fw = frame.shape[:2]
@@ -231,9 +266,11 @@ def run_tracked_stream(
 
         frame_idx += 1
 
+    if save_video and writer is None and pending_vis:
+        _ensure_writer(pending_vis[-1])
     if writer is not None:
         writer.release()
-        print(f"[save] {out_path}")
+        print(f"[save] {out_path}  fps={write_fps}")
     cv2.destroyAllWindows()
     print(f"[done] events={len(detector.events)} log={logger.csv_path}")
 
@@ -251,11 +288,17 @@ def run_synthetic(cfg: AppConfig, show: bool, save_video: bool) -> None:
         dets = [(o.track_id, *o.center) for o in tracked]
         states = motion.update(frame_idx, dets)
         bboxes = {o.track_id: tuple(map(float, o.bbox_xyxy)) for o in tracked}
-        events = detector.update(frame_idx, states, bboxes=bboxes)
+        events = detector.update(
+            frame_idx,
+            states,
+            bboxes=bboxes,
+            frame_shape=frame.shape[:2],
+        )
         if events:
             logger.log(events)
             recent.extend(events)
-            play_alert()
+            if cfg.sound_alert:
+                play_alert()
             for e in events:
                 print(
                     f"[ALERT] frame={e.frame_idx} id={e.track_id} "
@@ -275,7 +318,7 @@ def run_synthetic(cfg: AppConfig, show: bool, save_video: bool) -> None:
                 writer = cv2.VideoWriter(
                     str(out_path),
                     cv2.VideoWriter_fourcc(*"mp4v"),
-                    30,
+                    30.0,  # synthetic 장면 생성 FPS와 동일
                     (w, h),
                 )
             writer.write(vis)
@@ -284,7 +327,7 @@ def run_synthetic(cfg: AppConfig, show: bool, save_video: bool) -> None:
             continue
 
         cv2.imshow("tracking_alert", vis)
-        key = cv2.waitKey(30) & 0xFF
+        key = cv2.waitKey(1) & 0xFF
         if handle_keys(key, cfg, frame_idx, vis):
             break
 
@@ -310,7 +353,9 @@ def run_video(
     if not cap.isOpened():
         raise RuntimeError(f"영상을 열 수 없습니다: {source}")
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    # 원본 FPS 그대로 사용 (상한 없음). 메타가 없으면 처리 속도 측정.
+    meta_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    fps_hint = meta_fps if meta_fps > 1.0 else 0.0
     out_path = Path(cfg.output_dir) / out_name if save_video else None
 
     def frame_iter() -> Optional[np.ndarray]:
@@ -325,7 +370,7 @@ def run_video(
             save_video=save_video,
             out_name=out_name,
             wait_ms=1,
-            fps_hint=float(fps),
+            fps_hint=float(fps_hint),
             stop_event=stop_event,
             on_alert=on_alert,
             on_visual=on_visual,
@@ -388,7 +433,7 @@ def run_screen(
             save_video=save_video,
             out_name="screen_alert.mp4",
             wait_ms=1,
-            fps_hint=20.0,
+            fps_hint=0.0,  # 고정 20fps 한도 없음 → 실제 처리 속도 측정
             overlay=overlay,
             stop_event=stop_event,
             on_alert=on_alert,

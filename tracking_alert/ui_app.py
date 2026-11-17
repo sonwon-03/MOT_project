@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -32,6 +34,8 @@ from main import run_screen, run_video
 from src.overlay_win import ScreenOverlay, enable_dpi_awareness
 
 SETTINGS_PATH = ROOT / "user_settings.json"
+YOUTUBE_TEMP_DIR = ROOT / "video_library" / "youtube_temp"
+YOUTUBE_PERM_DIR = ROOT / "video_library" / "youtube"
 
 
 def list_monitors() -> list[dict]:
@@ -117,8 +121,8 @@ class StudioApp:
 
         self.root = tk.Tk()
         self.root.title("Tracking Alert")
-        self.root.geometry("1080x720")
-        self.root.minsize(900, 620)
+        self.root.geometry("1400x860")
+        self.root.minsize(1280, 800)
         self.root.configure(bg="#1b1d21")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -140,6 +144,15 @@ class StudioApp:
         self._eval_visual_lock = threading.Lock()
         self._preview_job: str | None = None
         self._eval_results_lock = threading.Lock()
+        self._leaving = False
+        self._closing = False
+        self._last_eval_paint = 0.0
+        self._last_capture_paint = 0.0
+        self._preview_geom: dict[str, tuple[int, int, float]] = {}
+        self._youtube_temp_path: Path | None = None
+        self._youtube_busy = False
+        # 이전 실행에서 남은 유튜브 임시 파일 정리
+        self._cleanup_youtube_temp(keep=None)
 
         self.container = tk.Frame(self.root, bg="#1b1d21")
         self.container.pack(fill="both", expand=True)
@@ -151,6 +164,7 @@ class StudioApp:
 
         self._build_home()
         self._show_home()
+        self.root.bind_all("<Escape>", lambda _e: self._back_to_home())
         self._poll_messages()
 
     # ── 공통 스타일 ──────────────────────────────────────────
@@ -159,10 +173,11 @@ class StudioApp:
             child.pack_forget()
 
     def _show_home(self) -> None:
-        if self._busy():
-            return
         self._stop_preview()
         self._close_overlay()
+        with self._eval_visual_lock:
+            self._eval_visuals = {}
+            self._eval_focus_job = None
         self.mode = None
         self._clear_container()
         if self.home_frame is None:
@@ -407,9 +422,11 @@ class StudioApp:
             highlightthickness=0,
             troughcolor="#101216",
             showvalue=True,
+            width=22,
+            sliderlength=36,
             command=self._on_review_seek,
         )
-        self.review_scale.pack(fill="x", padx=12)
+        self.review_scale.pack(fill="x", padx=12, pady=(2, 4))
         ctrl = tk.Frame(self.review_bar, bg=panel)
         ctrl.pack(fill="x", padx=12, pady=(4, 10))
         self.review_play_btn = tk.Button(
@@ -489,6 +506,8 @@ class StudioApp:
             highlightthickness=0,
             troughcolor="#101216",
             showvalue=False,
+            width=18,
+            sliderlength=32,
             command=self._on_review_speed_change,
         )
         self.review_speed_scale.pack(side="left", fill="x", expand=True, padx=(8, 8))
@@ -523,11 +542,11 @@ class StudioApp:
         self._review_job: str | None = None
         self._session_alerts: list = []
 
-        side = tk.Frame(body, bg=panel, width=340)
+        side = tk.Frame(body, bg=panel, width=420)
         side.pack(side="right", fill="y", padx=(12, 0))
         side.pack_propagate(False)
 
-        side_canvas = tk.Canvas(side, bg=panel, highlightthickness=0, width=320)
+        side_canvas = tk.Canvas(side, bg=panel, highlightthickness=0, width=400)
         side_scroll = ttk.Scrollbar(side, orient="vertical", command=side_canvas.yview)
         side_canvas.configure(yscrollcommand=side_scroll.set)
         side_scroll.pack(side="right", fill="y")
@@ -537,7 +556,7 @@ class StudioApp:
 
         def _sync_side(_event=None) -> None:
             side_canvas.configure(scrollregion=side_canvas.bbox("all"))
-            side_canvas.itemconfigure(side_window, width=side_canvas.winfo_width())
+            side_canvas.itemconfigure(side_window, width=max(side_canvas.winfo_width(), 380))
 
         side_inner.bind("<Configure>", _sync_side)
         side_canvas.bind("<Configure>", _sync_side)
@@ -637,7 +656,7 @@ class StudioApp:
             fg=fg,
             anchor="w",
             font=("Malgun Gothic", 9),
-            wraplength=300,
+            wraplength=380,
             justify="left",
         ).pack(fill="x", padx=14)
         open_row = tk.Frame(self.file_frame, bg=panel)
@@ -665,26 +684,104 @@ class StudioApp:
 
         tk.Label(
             self.file_frame,
-            text="저장소 영상 (더블클릭으로 선택)",
+            text="유튜브 URL",
             bg=panel,
             fg="#c5ccd6",
             font=("Malgun Gothic", 10),
         ).pack(anchor="w", padx=14, pady=(12, 4))
-        self.library_list = tk.Listbox(
+        self.youtube_var = tk.StringVar()
+        yt_row = tk.Frame(self.file_frame, bg=panel)
+        yt_row.pack(fill="x", padx=14)
+        self.youtube_entry = tk.Entry(
+            yt_row,
+            textvariable=self.youtube_var,
+            bg="#101216",
+            fg=fg,
+            insertbackground=fg,
+            relief="flat",
+            font=("Malgun Gothic", 9),
+        )
+        self.youtube_entry.pack(side="left", fill="x", expand=True, ipady=4)
+        self.youtube_entry.bind("<Return>", lambda _e: self._download_youtube())
+        self.youtube_btn = tk.Button(
+            yt_row,
+            text="가져오기",
+            command=self._download_youtube,
+            bg="#c0392b",
+            fg="white",
+            relief="flat",
+            padx=10,
+            pady=4,
+        )
+        self.youtube_btn.pack(side="left", padx=(6, 0))
+        yt_action = tk.Frame(self.file_frame, bg=panel)
+        yt_action.pack(fill="x", padx=14, pady=(4, 0))
+        self.youtube_status_var = tk.StringVar(value="임시로 받은 뒤, 원하면 영구 저장")
+        tk.Label(
+            yt_action,
+            textvariable=self.youtube_status_var,
+            bg=panel,
+            fg="#9aa3b2",
+            font=("Malgun Gothic", 8),
+            wraplength=300,
+            justify="left",
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+        self.youtube_save_btn = tk.Button(
+            yt_action,
+            text="영구 저장",
+            command=self._save_youtube_permanent,
+            bg="#3a4150",
+            fg=fg,
+            relief="flat",
+            padx=8,
+            pady=2,
+            state="disabled",
+        )
+        self.youtube_save_btn.pack(side="right", padx=(6, 0))
+
+        tk.Label(
             self.file_frame,
+            text="영상 목록 (임시·저장소 · 더블클릭 선택)",
+            bg=panel,
+            fg="#c5ccd6",
+            font=("Malgun Gothic", 10),
+        ).pack(anchor="w", padx=14, pady=(12, 4))
+        self.library_count_var = tk.StringVar(value="영상 0개")
+        tk.Label(
+            self.file_frame,
+            textvariable=self.library_count_var,
+            bg=panel,
+            fg="#9aa3b2",
+            font=("Malgun Gothic", 9),
+        ).pack(anchor="w", padx=14, pady=(0, 4))
+        lib_wrap = tk.Frame(self.file_frame, bg=panel)
+        lib_wrap.pack(fill="both", expand=False, padx=14)
+        self.library_list = tk.Listbox(
+            lib_wrap,
             bg="#101216",
             fg="#f3f5f7",
-            height=5,
-            highlightthickness=0,
-            activestyle="none",
+            height=8,
+            highlightthickness=1,
+            highlightbackground="#3a4150",
+            activestyle="dotbox",
             font=("Malgun Gothic", 9),
             exportselection=False,
+            selectmode="browse",
         )
-        self.library_list.pack(fill="x", padx=14)
+        lib_scroll = ttk.Scrollbar(
+            lib_wrap, orient="vertical", command=self.library_list.yview
+        )
+        self.library_list.configure(yscrollcommand=lib_scroll.set)
+        self.library_list.pack(side="left", fill="both", expand=True)
+        lib_scroll.pack(side="right", fill="y")
         self.library_list.bind("<Double-Button-1>", self._on_library_select)
+        self.library_list.bind("<Return>", self._on_library_select)
         self._library_paths: list[Path] = []
+        pick_row = tk.Frame(self.file_frame, bg=panel)
+        pick_row.pack(fill="x", padx=14, pady=(6, 0))
         tk.Button(
-            self.file_frame,
+            pick_row,
             text="저장소에서 선택",
             command=self._pick_library_video,
             bg="#3a6ea5",
@@ -692,10 +789,20 @@ class StudioApp:
             relief="flat",
             padx=8,
             pady=4,
-        ).pack(anchor="w", padx=14, pady=(6, 0))
+        ).pack(side="left")
+        tk.Button(
+            pick_row,
+            text="폴더 열기",
+            command=self._open_library_folder,
+            bg="#3a4150",
+            fg=fg,
+            relief="flat",
+            padx=8,
+            pady=4,
+        ).pack(side="left", padx=(6, 0))
         tk.Label(
             self.file_frame,
-            text="폴더: video_library / eval_data",
+            text="video_library · eval_data · sample_videos",
             bg=panel,
             fg="#9aa3b2",
             font=("Malgun Gothic", 8),
@@ -753,14 +860,14 @@ class StudioApp:
         header.pack(fill="x", padx=16, pady=(14, 6))
         tk.Button(
             header,
-            text="← 메인",
+            text="← 메인 (Esc)",
             command=self._back_to_home,
             bg="#3a4150",
             fg=fg,
             relief="flat",
-            padx=10,
-            pady=4,
-            font=("Malgun Gothic", 10),
+            padx=12,
+            pady=6,
+            font=("Malgun Gothic", 11, "bold"),
         ).pack(side="left")
         tk.Label(
             header,
@@ -784,11 +891,11 @@ class StudioApp:
         body.pack(fill="both", expand=True, padx=16, pady=8)
 
         # 고정폭 설정칸을 먼저 배치해 미리보기 이미지가 설정을 덮지 않게 한다.
-        side = tk.Frame(body, bg=panel, width=340)
+        side = tk.Frame(body, bg=panel, width=420)
         side.pack(side="right", fill="y", padx=(12, 0))
         side.pack_propagate(False)
 
-        side_canvas = tk.Canvas(side, bg=panel, highlightthickness=0, width=320)
+        side_canvas = tk.Canvas(side, bg=panel, highlightthickness=0, width=400)
         side_scroll = ttk.Scrollbar(side, orient="vertical", command=side_canvas.yview)
         side_canvas.configure(yscrollcommand=side_scroll.set)
         side_scroll.pack(side="right", fill="y")
@@ -798,7 +905,7 @@ class StudioApp:
 
         def _sync_eval_side(_event=None) -> None:
             side_canvas.configure(scrollregion=side_canvas.bbox("all"))
-            side_canvas.itemconfigure(side_window, width=side_canvas.winfo_width())
+            side_canvas.itemconfigure(side_window, width=max(side_canvas.winfo_width(), 380))
 
         side_inner.bind("<Configure>", _sync_eval_side)
         side_canvas.bind("<Configure>", _sync_eval_side)
@@ -861,10 +968,16 @@ class StudioApp:
             anchor="w",
         ).pack(fill="x", padx=12, pady=(0, 12))
 
-        self.eval_preview_host = tk.Frame(preview_wrap, bg="#101216")
+        self.eval_preview_host = tk.Frame(preview_wrap, bg="#101216", height=420)
         self.eval_preview_host.pack(fill="both", expand=True, padx=12, pady=(0, 8))
         self.eval_preview_host.pack_propagate(False)
-        self.eval_preview = tk.Label(self.eval_preview_host, bg="#101216")
+        self.eval_preview = tk.Label(
+            self.eval_preview_host,
+            bg="#101216",
+            text="평가를 시작하면 영상이 여기에 표시됩니다",
+            fg="#8b93a1",
+            font=("Malgun Gothic", 12),
+        )
         self.eval_preview.place(relx=0, rely=0, relwidth=1, relheight=1)
 
         tk.Label(
@@ -905,8 +1018,9 @@ class StudioApp:
             font=("Malgun Gothic", 10),
         ).pack(anchor="w", padx=14, pady=(12, 4))
         saved_workers = (self._settings or {}).get("eval", {}).get("workers")
+        # 미리보기가 보이게 기본 1. GPU에서 워커를 늘리면 멈춘 것처럼 보일 수 있음
         self.eval_workers_var = tk.IntVar(
-            value=int(saved_workers) if saved_workers else default_workers()
+            value=int(saved_workers) if saved_workers else 1
         )
         tk.Scale(
             side,
@@ -922,7 +1036,7 @@ class StudioApp:
         ).pack(fill="x", padx=14)
         tk.Label(
             side,
-            text="여러 영상을 동시에 평가합니다",
+            text="미리보기 볼 때는 1 권장  ·  높이면 속도↑ 화면 멈춤 가능",
             bg=panel,
             fg="#9aa3b2",
             font=("Malgun Gothic", 9),
@@ -991,10 +1105,21 @@ class StudioApp:
         label("사고 판정 민감도")
         sens = tk.IntVar(value=int(saved.get("sensitivity", 3)))
         conf = tk.DoubleVar(value=float(saved.get("conf", 0.05)))
-        occ = tk.DoubleVar(value=float(saved.get("occlusion_sec", 1.0)))
+        occ_on = tk.BooleanVar(
+            value=bool(saved.get("occlusion", saved.get("occlusion_sec", 1.0) > 0))
+        )
+        occ = tk.DoubleVar(
+            value=float(
+                saved.get("occlusion_sec", 1.0)
+                if float(saved.get("occlusion_sec", 1.0)) > 0
+                else 1.0
+            )
+        )
         spike = tk.BooleanVar(value=bool(saved.get("spike", True)))
         confirm = tk.BooleanVar(value=bool(saved.get("confirm", True)))
         prox = tk.BooleanVar(value=bool(saved.get("prox", True)))
+        small_boost = tk.BooleanVar(value=bool(saved.get("small_object_boost", True)))
+        sound_alert = tk.BooleanVar(value=bool(saved.get("sound_alert", True)))
 
         tk.Scale(
             parent,
@@ -1017,30 +1142,83 @@ class StudioApp:
         ).pack(anchor="w", padx=14)
 
         label("검출 신뢰도")
-        tk.Scale(
-            parent,
-            from_=0.01,
+        conf_row = tk.Frame(parent, bg=panel)
+        conf_row.pack(fill="x", padx=14)
+        conf_scale = tk.Scale(
+            conf_row,
+            from_=0.001,
             to=0.8,
-            resolution=0.01,
+            resolution=0.001,
             orient="horizontal",
             variable=conf,
             bg=panel,
             fg=fg,
             highlightthickness=0,
             troughcolor="#101216",
-        ).pack(fill="x", padx=14)
+            showvalue=0,
+        )
+        conf_scale.pack(side="left", fill="x", expand=True)
+        conf_entry = tk.Entry(
+            conf_row,
+            width=7,
+            bg="#101216",
+            fg=fg,
+            insertbackground=fg,
+            relief="flat",
+            font=("Consolas", 11),
+            justify="center",
+        )
+        conf_entry.pack(side="right", padx=(8, 0))
+        conf_entry.insert(0, f"{float(conf.get()):.3f}")
+
+        def _clamp_conf(value: float) -> float:
+            return float(max(0.001, min(0.8, value)))
+
+        def _sync_conf_entry(*_args) -> None:
+            try:
+                text = f"{_clamp_conf(float(conf.get())):.3f}"
+            except Exception:
+                return
+            if conf_entry.get() != text:
+                conf_entry.delete(0, "end")
+                conf_entry.insert(0, text)
+
+        def _apply_conf_entry(_event=None) -> None:
+            raw = conf_entry.get().strip().replace(",", ".")
+            try:
+                value = _clamp_conf(float(raw))
+            except Exception:
+                _sync_conf_entry()
+                return
+            conf.set(value)
+            _sync_conf_entry()
+
+        conf.trace_add("write", lambda *_: _sync_conf_entry())
+        conf_entry.bind("<Return>", _apply_conf_entry)
+        conf_entry.bind("<FocusOut>", _apply_conf_entry)
         tk.Label(
             parent,
-            text="낮출수록 더 많이 잡힘  ·  너무 낮으면 잡음↑",
+            text="슬라이더 또는 직접 입력  ·  0.001~0.8  ·  낮출수록 더 많이 잡힘",
             bg=panel,
             fg="#9aa3b2",
             font=("Malgun Gothic", 9),
         ).pack(anchor="w", padx=14)
 
-        label("가림 예측 유지 시간(초)")
-        tk.Scale(
+        tk.Checkbutton(
             parent,
-            from_=0.0,
+            text="가림 예측",
+            variable=occ_on,
+            bg=panel,
+            fg=fg,
+            selectcolor="#101216",
+            activebackground=panel,
+            activeforeground=fg,
+            font=("Malgun Gothic", 10),
+        ).pack(anchor="w", padx=14, pady=(12, 0))
+        label("가림 예측 유지 시간(초)")
+        occ_scale = tk.Scale(
+            parent,
+            from_=0.5,
             to=3.0,
             resolution=0.5,
             orient="horizontal",
@@ -1049,16 +1227,28 @@ class StudioApp:
             fg=fg,
             highlightthickness=0,
             troughcolor="#101216",
-        ).pack(fill="x", padx=14)
+            state="normal" if occ_on.get() else "disabled",
+        )
+        occ_scale.pack(fill="x", padx=14)
         tk.Label(
             parent,
-            text="0이면 끔  ·  점선 박스로 표시",
+            text="켜면 주황 점선으로 가려진 위치 예측",
             bg=panel,
             fg="#9aa3b2",
             font=("Malgun Gothic", 9),
         ).pack(anchor="w", padx=14)
 
+        def _sync_occ_scale(*_args) -> None:
+            on = bool(occ_on.get())
+            occ_scale.configure(state="normal" if on else "disabled")
+            if on and float(occ.get()) <= 0:
+                occ.set(1.0)
+
+        occ_on.trace_add("write", _sync_occ_scale)
+
         for text, var in (
+            ("사고 알림음", sound_alert),
+            ("소형/저화질 검출 강화", small_boost),
             ("가속도 급변", spike),
             ("급변 후 상태 유지", confirm),
             ("근접하면 충돌 태그", prox),
@@ -1074,21 +1264,41 @@ class StudioApp:
                 activeforeground=fg,
                 font=("Malgun Gothic", 10),
             ).pack(anchor="w", padx=14)
+        tk.Label(
+            parent,
+            text="사고 확정 시 Windows 알림음 · 끄면 소리만 음소거",
+            bg=panel,
+            fg="#9aa3b2",
+            font=("Malgun Gothic", 9),
+        ).pack(anchor="w", padx=14)
+        tk.Label(
+            parent,
+            text="작은 차량·낮은 해상도에서 검출을 올립니다 (속도↓)",
+            bg=panel,
+            fg="#9aa3b2",
+            font=("Malgun Gothic", 9),
+        ).pack(anchor="w", padx=14)
 
         if prefix == "cap":
             self.sensitivity_var = sens
             self.conf_var = conf
+            self.occlusion_var = occ_on
             self.occlusion_sec_var = occ
             self.spike_var = spike
             self.confirm_var = confirm
             self.prox_var = prox
+            self.small_object_boost_var = small_boost
+            self.sound_alert_var = sound_alert
         else:
             self.eval_sensitivity_var = sens
             self.eval_conf_var = conf
+            self.eval_occlusion_var = occ_on
             self.eval_occlusion_sec_var = occ
             self.eval_spike_var = spike
             self.eval_confirm_var = confirm
             self.eval_prox_var = prox
+            self.eval_small_object_boost_var = small_boost
+            self.eval_sound_alert_var = sound_alert
 
     # ── 설정 저장 / 불러오기 ─────────────────────────────────
     def _default_settings(self) -> dict:
@@ -1096,7 +1306,10 @@ class StudioApp:
             "cap": {
                 "sensitivity": 3,
                 "conf": 0.05,
+                "occlusion": True,
                 "occlusion_sec": 1.0,
+                "small_object_boost": True,
+                "sound_alert": True,
                 "spike": True,
                 "confirm": True,
                 "prox": True,
@@ -1104,11 +1317,14 @@ class StudioApp:
             "eval": {
                 "sensitivity": 3,
                 "conf": 0.05,
+                "occlusion": True,
                 "occlusion_sec": 1.0,
+                "small_object_boost": True,
+                "sound_alert": False,
                 "spike": True,
                 "confirm": True,
                 "prox": True,
-                "workers": default_workers(),
+                "workers": 1,
             },
             "review_speed": 1.0,
         }
@@ -1140,7 +1356,10 @@ class StudioApp:
             data["cap"] = {
                 "sensitivity": int(self.sensitivity_var.get()),
                 "conf": float(self.conf_var.get()),
+                "occlusion": bool(self.occlusion_var.get()),
                 "occlusion_sec": float(self.occlusion_sec_var.get()),
+                "small_object_boost": bool(self.small_object_boost_var.get()),
+                "sound_alert": bool(self.sound_alert_var.get()),
                 "spike": bool(self.spike_var.get()),
                 "confirm": bool(self.confirm_var.get()),
                 "prox": bool(self.prox_var.get()),
@@ -1149,7 +1368,10 @@ class StudioApp:
             data["eval"] = {
                 "sensitivity": int(self.eval_sensitivity_var.get()),
                 "conf": float(self.eval_conf_var.get()),
+                "occlusion": bool(self.eval_occlusion_var.get()),
                 "occlusion_sec": float(self.eval_occlusion_sec_var.get()),
+                "small_object_boost": bool(self.eval_small_object_boost_var.get()),
+                "sound_alert": bool(self.eval_sound_alert_var.get()),
                 "spike": bool(self.eval_spike_var.get()),
                 "confirm": bool(self.eval_confirm_var.get()),
                 "prox": bool(self.eval_prox_var.get()),
@@ -1201,14 +1423,30 @@ class StudioApp:
             if key == "cap" and hasattr(self, "sensitivity_var"):
                 self.sensitivity_var.set(int(block.get("sensitivity", 3)))
                 self.conf_var.set(float(block.get("conf", 0.05)))
-                self.occlusion_sec_var.set(float(block.get("occlusion_sec", 1.0)))
+                occ_sec = float(block.get("occlusion_sec", 1.0))
+                self.occlusion_var.set(
+                    bool(block.get("occlusion", occ_sec > 0))
+                )
+                self.occlusion_sec_var.set(occ_sec if occ_sec > 0 else 1.0)
+                self.small_object_boost_var.set(
+                    bool(block.get("small_object_boost", True))
+                )
+                self.sound_alert_var.set(bool(block.get("sound_alert", True)))
                 self.spike_var.set(bool(block.get("spike", True)))
                 self.confirm_var.set(bool(block.get("confirm", True)))
                 self.prox_var.set(bool(block.get("prox", True)))
             if key == "eval" and hasattr(self, "eval_sensitivity_var"):
                 self.eval_sensitivity_var.set(int(block.get("sensitivity", 3)))
                 self.eval_conf_var.set(float(block.get("conf", 0.05)))
-                self.eval_occlusion_sec_var.set(float(block.get("occlusion_sec", 1.0)))
+                occ_sec = float(block.get("occlusion_sec", 1.0))
+                self.eval_occlusion_var.set(
+                    bool(block.get("occlusion", occ_sec > 0))
+                )
+                self.eval_occlusion_sec_var.set(occ_sec if occ_sec > 0 else 1.0)
+                self.eval_small_object_boost_var.set(
+                    bool(block.get("small_object_boost", True))
+                )
+                self.eval_sound_alert_var.set(bool(block.get("sound_alert", False)))
                 self.eval_spike_var.set(bool(block.get("spike", True)))
                 self.eval_confirm_var.set(bool(block.get("confirm", True)))
                 self.eval_prox_var.set(bool(block.get("prox", True)))
@@ -1233,15 +1471,47 @@ class StudioApp:
                 self.eval_log.insert(0, "설정 불러오기 완료")
 
     # ── 캡처 모드 동작 ───────────────────────────────────────
-    def _back_to_home(self) -> None:
-        if self._busy():
-            if self.mode == "capture" and hasattr(self, "log"):
-                self.log.insert(0, "작업 중에는 메인으로 돌아갈 수 없습니다")
-            elif self.mode == "eval" and hasattr(self, "eval_log"):
-                self.eval_log.insert(0, "평가 중에는 메인으로 돌아갈 수 없습니다")
+    def _abort_background_work(self) -> None:
+        """평가/추적 워커에 중지 신호를 보내고 UI 상태를 즉시 해제한다."""
+        try:
+            self.stop_event.set()
+        except Exception:
+            pass
+        self.evaluating = False
+        self.tracking = False
+        with self._eval_visual_lock:
+            self._eval_visuals = {}
+            self._eval_focus_job = None
+        with self._visual_lock:
+            self._visual = None
+
+    def _back_to_home(self, _event=None) -> None:
+        if self._closing:
             return
+        # 미리보기 인코딩이 메인스레드를 점유해도 바로 빠져나오게 한다.
+        self._leaving = True
+        self._abort_background_work()
+        try:
+            if hasattr(self, "eval_btn"):
+                self.eval_btn.configure(state="normal", text="평가 시작")
+            if hasattr(self, "eval_stop_btn"):
+                self.eval_stop_btn.configure(
+                    state="disabled", bg="#3a4150", fg="#f3f5f7"
+                )
+            if hasattr(self, "start_btn"):
+                self.start_btn.configure(text="추적 시작", bg="#2f9e44", state="normal")
+        except Exception:
+            pass
+        self._close_overlay()
         self._close_review()
-        self._show_home()
+        # 클릭 핸들러가 끝난 뒤 화면 전환 (UI 멈춤 완화)
+        self.root.after(10, self._finish_back_to_home)
+
+    def _finish_back_to_home(self) -> None:
+        try:
+            self._show_home()
+        finally:
+            self._leaving = False
 
     def _on_source_change(self) -> None:
         if self.source_var.get() == "화면":
@@ -1288,25 +1558,266 @@ class StudioApp:
             return
         self._set_video_path(Path(path), source_label="파일")
 
-    def _library_roots(self) -> list[tuple[str, Path]]:
-        return [
-            ("library", ROOT / "video_library"),
-            ("accident", ROOT / "eval_data" / "accident"),
-            ("normal", ROOT / "eval_data" / "normal"),
-        ]
+    @staticmethod
+    def _is_youtube_url(url: str) -> bool:
+        text = (url or "").strip().lower()
+        return any(
+            host in text
+            for host in (
+                "youtube.com/",
+                "youtu.be/",
+                "youtube.com/shorts/",
+                "m.youtube.com/",
+            )
+        )
 
-    def _refresh_video_library(self) -> None:
+    @staticmethod
+    def _is_under_dir(path: Path, folder: Path) -> bool:
+        try:
+            path.resolve().relative_to(folder.resolve())
+            return True
+        except Exception:
+            return False
+
+    def _is_youtube_temp(self, path: Path | None) -> bool:
+        if path is None:
+            return False
+        return self._is_under_dir(path, YOUTUBE_TEMP_DIR)
+
+    def _set_youtube_save_enabled(self, enabled: bool) -> None:
+        if not hasattr(self, "youtube_save_btn"):
+            return
+        self.youtube_save_btn.configure(state="normal" if enabled else "disabled")
+
+    def _cleanup_youtube_temp(self, keep: Path | None = None) -> None:
+        """임시 유튜브 파일을 지운다. keep만 남긴다."""
+        try:
+            YOUTUBE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+        keep_key = ""
+        if keep is not None:
+            try:
+                keep_key = str(keep.resolve()).lower()
+            except Exception:
+                keep_key = str(keep).lower()
+        for path in YOUTUBE_TEMP_DIR.iterdir():
+            try:
+                if not path.is_file():
+                    continue
+                key = str(path.resolve()).lower()
+                if keep_key and key == keep_key:
+                    continue
+                path.unlink(missing_ok=True)
+            except Exception:
+                continue
+
+    def _save_youtube_permanent(self) -> None:
+        if self.tracking or self.evaluating:
+            return
+        src = self._youtube_temp_path
+        if src is None or not src.exists() or not self._is_youtube_temp(src):
+            if hasattr(self, "youtube_status_var"):
+                self.youtube_status_var.set("영구 저장할 임시 영상이 없습니다")
+            self._set_youtube_save_enabled(False)
+            return
+        try:
+            YOUTUBE_PERM_DIR.mkdir(parents=True, exist_ok=True)
+            dest = YOUTUBE_PERM_DIR / src.name
+            if dest.exists():
+                stem, suffix = dest.stem, dest.suffix
+                n = 2
+                while True:
+                    cand = YOUTUBE_PERM_DIR / f"{stem}_{n}{suffix}"
+                    if not cand.exists():
+                        dest = cand
+                        break
+                    n += 1
+            shutil.move(str(src), str(dest))
+            self._youtube_temp_path = None
+            self._set_video_path(dest, source_label="유튜브(영구)")
+            self._set_youtube_save_enabled(False)
+            self._refresh_video_library()
+            if hasattr(self, "youtube_status_var"):
+                self.youtube_status_var.set(f"영구 저장됨: {dest.name}")
+            if hasattr(self, "log"):
+                self.log.insert(0, f"유튜브 영구 저장: {dest}")
+        except Exception as exc:
+            if hasattr(self, "youtube_status_var"):
+                self.youtube_status_var.set(f"영구 저장 실패: {str(exc)[:60]}")
+            if hasattr(self, "log"):
+                self.log.insert(0, f"유튜브 영구 저장 실패: {exc}")
+
+    def _download_youtube(self) -> None:
+        if self.tracking or self.evaluating:
+            return
+        if getattr(self, "_youtube_busy", False):
+            return
+        url = self.youtube_var.get().strip() if hasattr(self, "youtube_var") else ""
+        if not url:
+            if hasattr(self, "youtube_status_var"):
+                self.youtube_status_var.set("유튜브 링크를 입력하세요")
+            return
+        if not self._is_youtube_url(url):
+            if hasattr(self, "youtube_status_var"):
+                self.youtube_status_var.set("유튜브 주소가 아닌 것 같습니다")
+            return
+
+        # 새 다운로드 전: 이전 임시 파일 정리 (현재 선택 임시본 포함 → 곧 교체)
+        self._cleanup_youtube_temp(keep=None)
+        self._youtube_temp_path = None
+        self._set_youtube_save_enabled(False)
+
+        out_dir = YOUTUBE_TEMP_DIR
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self._youtube_busy = True
+        if hasattr(self, "youtube_btn"):
+            self.youtube_btn.configure(state="disabled", text="받는 중")
+        if hasattr(self, "youtube_status_var"):
+            self.youtube_status_var.set("임시 다운로드 중…")
+        if hasattr(self, "log"):
+            self.log.insert(0, f"유튜브 임시 다운로드 시작: {url}")
+
+        def work() -> None:
+            try:
+                from yt_dlp import YoutubeDL
+
+                outtmpl = str(out_dir / "%(title).80B [%(id)s].%(ext)s")
+                ydl_opts = {
+                    "format": (
+                        "bestvideo[ext=mp4][vcodec^=avc1][height<=720]"
+                        "/bestvideo[ext=mp4][height<=720]"
+                        "/best[ext=mp4][height<=720]"
+                        "/best[height<=720]"
+                        "/best"
+                    ),
+                    "outtmpl": outtmpl,
+                    "overwrites": True,
+                    "noplaylist": True,
+                    "quiet": True,
+                    "no_warnings": True,
+                }
+                with YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if info is None:
+                        raise RuntimeError("영상 정보를 가져오지 못했습니다")
+                    if "entries" in info:
+                        entries = [e for e in info["entries"] if e]
+                        if not entries:
+                            raise RuntimeError("재생목록에서 영상을 찾지 못했습니다")
+                        info = entries[0]
+                    path = Path(ydl.prepare_filename(info))
+                    if not path.exists():
+                        vid = str(info.get("id", ""))
+                        candidates = [
+                            p
+                            for p in out_dir.glob("*")
+                            if p.is_file() and (not vid or vid in p.name)
+                        ]
+                        if not candidates:
+                            raise RuntimeError("다운로드 파일을 찾지 못했습니다")
+                        path = max(candidates, key=lambda p: p.stat().st_mtime)
+                self.messages.put(("youtube_done", {"path": str(path), "ok": True}))
+            except Exception as exc:
+                self.messages.put(("youtube_done", {"ok": False, "error": str(exc)}))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _library_roots(self) -> list[tuple[str, Path, bool]]:
+        """(표시태그, 경로, 하위폴더 검색여부)"""
+        roots = [
+            ("임시", YOUTUBE_TEMP_DIR, False),
+            ("library", ROOT / "video_library", True),
+            ("accident", ROOT / "eval_data" / "accident", False),
+            ("normal", ROOT / "eval_data" / "normal", False),
+            ("sample", ROOT / "sample_videos", True),
+            ("sample", ROOT.parent / "sample_videos", True),
+        ]
+        # MOT_project 복사본에서 실행해도 원본 eval_data를 찾게 함
+        sibling = ROOT.parent / "tracking_alert"
+        if sibling.resolve() != ROOT.resolve():
+            roots.extend(
+                [
+                    ("accident", sibling / "eval_data" / "accident", False),
+                    ("normal", sibling / "eval_data" / "normal", False),
+                    ("library", sibling / "video_library", True),
+                ]
+            )
+        return roots
+
+    def _refresh_video_library(self, select_path: Path | None = None) -> None:
         if not hasattr(self, "library_list"):
             return
         self.library_list.delete(0, tk.END)
         self._library_paths = []
-        for tag, folder in self._library_roots():
-            folder.mkdir(parents=True, exist_ok=True)
-            for path in list_videos(folder):
-                self._library_paths.append(path)
-                self.library_list.insert(tk.END, f"[{tag}] {path.name}")
+        seen: set[str] = set()
+        temp_items: list[tuple[str, Path]] = []
+        other_items: list[tuple[str, Path]] = []
+        for tag, folder, recursive in self._library_roots():
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                continue
+            for path in list_videos(folder, recursive=recursive):
+                key = str(path.resolve()).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                is_temp = "youtube_temp" in {p.lower() for p in path.parts}
+                # library 재귀 검색에서 임시 폴더는 [임시] 루트만 사용
+                if is_temp and tag != "임시":
+                    continue
+                display_tag = "임시" if is_temp else tag
+                if path.parent.name.lower() == "youtube" and not is_temp:
+                    display_tag = "유튜브"
+                item = (display_tag, path)
+                if is_temp:
+                    temp_items.append(item)
+                else:
+                    other_items.append(item)
+        for display_tag, path in temp_items + other_items:
+            self._library_paths.append(path)
+            self.library_list.insert(tk.END, f"[{display_tag}] {path.name}")
+        if hasattr(self, "library_count_var"):
+            self.library_count_var.set(f"영상 {len(self._library_paths)}개")
         if not self._library_paths:
             self.library_list.insert(tk.END, "(저장소에 영상 없음)")
+            if hasattr(self, "log"):
+                self.log.insert(
+                    0,
+                    f"영상 없음. 이 폴더에 mp4를 넣으세요: {ROOT / 'video_library'}",
+                )
+        elif hasattr(self, "log"):
+            self.log.insert(0, f"저장소 목록 새로고침: {len(self._library_paths)}개")
+        if select_path is not None:
+            self._highlight_library_path(select_path)
+
+    def _highlight_library_path(self, path: Path) -> None:
+        if not hasattr(self, "library_list") or not self._library_paths:
+            return
+        try:
+            target = path.resolve()
+        except Exception:
+            target = path
+        for i, p in enumerate(self._library_paths):
+            try:
+                same = p.resolve() == target
+            except Exception:
+                same = p == path
+            if same:
+                self.library_list.selection_clear(0, tk.END)
+                self.library_list.selection_set(i)
+                self.library_list.see(i)
+                break
+
+    def _open_library_folder(self) -> None:
+        folder = ROOT / "video_library"
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(folder))  # type: ignore[attr-defined]
+        except Exception as exc:
+            if hasattr(self, "log"):
+                self.log.insert(0, f"폴더 열기 실패: {exc}")
 
     def _pick_library_video(self) -> None:
         if self.tracking or self.evaluating:
@@ -1316,10 +1827,12 @@ class StudioApp:
         sel = self.library_list.curselection()
         if not sel:
             if hasattr(self, "log"):
-                self.log.insert(0, "저장소에서 영상을 먼저 선택하세요")
+                self.log.insert(0, "저장소 목록에서 영상을 클릭해 고르세요")
             return
         index = int(sel[0])
         if index < 0 or index >= len(self._library_paths):
+            if hasattr(self, "log"):
+                self.log.insert(0, "선택 항목이 유효하지 않습니다. 새로고침 후 다시 선택하세요")
             return
         self._set_video_path(self._library_paths[index], source_label="저장소")
 
@@ -1327,8 +1840,26 @@ class StudioApp:
         self._pick_library_video()
 
     def _set_video_path(self, path: Path, source_label: str = "") -> None:
+        prev = self.video_path
         self.video_path = path
-        prefix = f"{source_label}: " if source_label else ""
+        if self._is_youtube_temp(path):
+            # 다른 임시 영상을 고르면 이전 임시본만 정리
+            self._cleanup_youtube_temp(keep=path)
+            self._youtube_temp_path = path
+            self._set_youtube_save_enabled(True)
+            label = source_label or "유튜브(임시)"
+        else:
+            # 영구/다른 영상을 고르면 임시본 삭제
+            if (
+                prev is not None
+                and self._is_youtube_temp(prev)
+                and prev.resolve() != path.resolve()
+            ):
+                self._cleanup_youtube_temp(keep=None)
+            self._youtube_temp_path = None
+            self._set_youtube_save_enabled(False)
+            label = source_label
+        prefix = f"{label}: " if label else ""
         self.video_var.set(f"{prefix}{path.name}")
         if hasattr(self, "log"):
             self.log.insert(0, f"영상 선택: {path}")
@@ -1349,12 +1880,17 @@ class StudioApp:
         spike: bool,
         confirm: bool,
         prox: bool,
+        small_object_boost: bool = True,
+        sound_alert: bool = True,
         output_dir: str = "outputs",
     ) -> AppConfig:
         cfg = AppConfig(
-            conf=conf,
+            conf=float(max(0.001, min(0.8, conf))),
             output_dir=output_dir,
             occlusion_hold_sec=occlusion_sec,
+            small_object_boost=small_object_boost,
+            imgsz=1280 if small_object_boost else 960,
+            sound_alert=bool(sound_alert),
             event=EventConfig(
                 use_accel_spike=spike,
                 use_post_state_confirm=confirm,
@@ -1364,24 +1900,37 @@ class StudioApp:
         cfg.event.apply_sensitivity(sensitivity)
         return cfg
 
+    def _occlusion_hold_from_ui(self, *, eval_mode: bool = False) -> float:
+        if eval_mode:
+            if not bool(self.eval_occlusion_var.get()):
+                return 0.0
+            return max(0.5, float(self.eval_occlusion_sec_var.get()))
+        if not bool(self.occlusion_var.get()):
+            return 0.0
+        return max(0.5, float(self.occlusion_sec_var.get()))
+
     def _make_cfg(self) -> AppConfig:
         return self._make_cfg_from(
             int(self.sensitivity_var.get()),
             float(self.conf_var.get()),
-            float(self.occlusion_sec_var.get()),
+            self._occlusion_hold_from_ui(eval_mode=False),
             bool(self.spike_var.get()),
             bool(self.confirm_var.get()),
             bool(self.prox_var.get()),
+            bool(self.small_object_boost_var.get()),
+            bool(self.sound_alert_var.get()),
         )
 
     def _make_eval_cfg(self) -> AppConfig:
         return self._make_cfg_from(
             int(self.eval_sensitivity_var.get()),
             float(self.eval_conf_var.get()),
-            float(self.eval_occlusion_sec_var.get()),
+            self._occlusion_hold_from_ui(eval_mode=True),
             bool(self.eval_spike_var.get()),
             bool(self.eval_confirm_var.get()),
             bool(self.eval_prox_var.get()),
+            bool(self.eval_small_object_boost_var.get()),
+            bool(self.eval_sound_alert_var.get()),
             output_dir="outputs/eval_accuracy",
         )
 
@@ -1397,6 +1946,63 @@ class StudioApp:
         self._stop_preview()
         self._preview_job = self.root.after(120, self._update_preview)
 
+    def _host_size(self, size_ref: tk.Misc, cache_key: str) -> tuple[int, int]:
+        """호스트 크기. update_idletasks는 가끔만 호출해 UI가 덜 끊기게 한다."""
+        now = time.perf_counter()
+        cached = self._preview_geom.get(cache_key)
+        if cached is not None and now - cached[2] < 0.8:
+            return cached[0], cached[1]
+        try:
+            if cached is None:
+                size_ref.update_idletasks()
+        except Exception:
+            pass
+        canvas_w = max(int(size_ref.winfo_width()), 320)
+        canvas_h = max(int(size_ref.winfo_height()), 180)
+        self._preview_geom[cache_key] = (canvas_w, canvas_h, now)
+        return canvas_w, canvas_h
+
+    @staticmethod
+    def _bgr_to_photo(bgr: np.ndarray) -> tk.PhotoImage | None:
+        """OpenCV BGR → Tk PhotoImage.
+
+        주의: cv2.imencode('.png', …)는 BGR 입력을 가정한다.
+        RGB로 바꾼 뒤 PNG로 넣으면 R↔B가 뒤집혀 '반전 필터'처럼 보인다.
+        PPM(P6)은 RGB를 그대로 쓰므로 색이 맞고 PNG 압축보다 훨씬 빠르다.
+        """
+        rgb = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        h, w = rgb.shape[:2]
+        header = f"P6 {w} {h} 255\n".encode("ascii")
+        try:
+            return tk.PhotoImage(data=header + rgb.tobytes())
+        except tk.TclError:
+            # PPM 실패 시에만 PNG (BGR 그대로 인코딩)
+            ok, buf = cv2.imencode(
+                ".png",
+                bgr,
+                [int(cv2.IMWRITE_PNG_COMPRESSION), 1],
+            )
+            if not ok:
+                return None
+            try:
+                return tk.PhotoImage(data=buf.tobytes())
+            except tk.TclError:
+                return None
+
+    def _letterbox_bgr(
+        self, frame: np.ndarray, canvas_w: int, canvas_h: int
+    ) -> np.ndarray:
+        scale = min(canvas_w / frame.shape[1], canvas_h / frame.shape[0])
+        nw = max(1, int(frame.shape[1] * scale))
+        nh = max(1, int(frame.shape[0] * scale))
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        view = cv2.resize(frame, (nw, nh), interpolation=interp)
+        canvas = np.full((canvas_h, canvas_w, 3), 16, dtype=np.uint8)
+        x0 = (canvas_w - nw) // 2
+        y0 = (canvas_h - nh) // 2
+        canvas[y0 : y0 + nh, x0 : x0 + nw] = view
+        return canvas
+
     def _show_bgr_on(
         self,
         widget: tk.Label,
@@ -1405,28 +2011,27 @@ class StudioApp:
         letterbox: bool = False,
         size_widget: tk.Misc | None = None,
     ) -> None:
-        size_ref = size_widget or widget
-        canvas_w = max(size_ref.winfo_width(), 320)
-        canvas_h = max(size_ref.winfo_height(), 180)
-        scale = min(canvas_w / frame.shape[1], canvas_h / frame.shape[0])
-        view = cv2.resize(
-            frame,
-            (max(1, int(frame.shape[1] * scale)), max(1, int(frame.shape[0] * scale))),
-            interpolation=cv2.INTER_AREA,
-        )
-        if letterbox:
-            canvas = np.full((canvas_h, canvas_w, 3), 16, dtype=np.uint8)
-            x0 = (canvas_w - view.shape[1]) // 2
-            y0 = (canvas_h - view.shape[0]) // 2
-            canvas[y0 : y0 + view.shape[0], x0 : x0 + view.shape[1]] = view
-            view = canvas
-        view = cv2.cvtColor(view, cv2.COLOR_BGR2RGB)
-        ok, buf = cv2.imencode(".png", view)
-        if not ok:
+        if self._leaving or self._closing:
             return
-        photo = tk.PhotoImage(data=buf.tobytes())
+        size_ref = size_widget or widget
+        canvas_w, canvas_h = self._host_size(size_ref, image_attr)
+        if letterbox:
+            view = self._letterbox_bgr(frame, canvas_w, canvas_h)
+        else:
+            scale = min(canvas_w / frame.shape[1], canvas_h / frame.shape[0])
+            view = cv2.resize(
+                frame,
+                (
+                    max(1, int(frame.shape[1] * scale)),
+                    max(1, int(frame.shape[0] * scale)),
+                ),
+                interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR,
+            )
+        photo = self._bgr_to_photo(view)
+        if photo is None:
+            return
         setattr(self, image_attr, photo)
-        widget.configure(image=photo)
+        widget.configure(image=photo, text="")
 
     def _show_bgr(self, frame: np.ndarray) -> None:
         if hasattr(self, "preview"):
@@ -1645,28 +2250,54 @@ class StudioApp:
         self.start_btn.configure(state="disabled")
 
     def _stop_eval(self) -> None:
-        if not self.evaluating:
+        if not self.evaluating and not self.stop_event.is_set():
             return
         self.stop_event.set()
         self._set_eval_status("중지 중", "#f0b429")
         if hasattr(self, "eval_stop_btn"):
             self.eval_stop_btn.configure(state="disabled")
+        if hasattr(self, "eval_log"):
+            self.eval_log.insert(0, "평가 중지 요청…")
+        # 워커가 바로 안 끝나도 UI는 다시 조작 가능하게
+        self.root.after(500, self._force_eval_idle)
+
+    def _force_eval_idle(self) -> None:
+        if self._closing or self._leaving:
+            return
+        if not self.evaluating:
+            return
+        # stop 후에도 evaluating이 남아 있으면 강제로 풀어 메인/종료가 막히지 않게 한다
+        if self.stop_event.is_set():
+            self.evaluating = False
+            with self._eval_visual_lock:
+                self._eval_visuals = {}
+            if hasattr(self, "eval_btn"):
+                self.eval_btn.configure(state="normal", text="평가 시작")
+            self._set_eval_status("평가 중지됨", "#f0b429")
+            if hasattr(self, "eval_log"):
+                self.eval_log.insert(0, "평가 UI 잠금 해제 (백그라운드는 곧 종료)")
 
     def _run_eval(self) -> None:
-        if self._busy():
+        if self.tracking:
+            return
+        if self.evaluating:
+            self.eval_log.insert(0, "이미 평가 중입니다. 중지 후 다시 시작하세요")
             return
         data_root = ROOT / "eval_data"
         accident = list_videos(data_root / "accident")
         normal = list_videos(data_root / "normal")
         if not accident and not normal:
             self.eval_log.insert(0, "오류: eval_data/accident, normal 에 영상이 없습니다")
+            self.eval_log.insert(0, f"경로: {data_root}")
             return
 
-        workers = default_workers(
+        # 미리보기용으로는 1이 안정적. 요청값이 있으면 존중하되 GPU 폭주 방지로 상한 유지
+        requested = (
             int(self.eval_workers_var.get())
             if hasattr(self, "eval_workers_var")
-            else 0
+            else 1
         )
+        workers = default_workers(requested)
         self.evaluating = True
         self.stop_event = threading.Event()
         with self._eval_visual_lock:
@@ -1675,18 +2306,31 @@ class StudioApp:
         self.eval_btn.configure(state="disabled", text="평가 중...")
         if hasattr(self, "eval_stop_btn"):
             self.eval_stop_btn.configure(state="normal", bg="#d64545", fg="white")
-        self._set_eval_status(f"병렬 평가 중 ×{workers}", "#f0b429")
+        self._set_eval_status(f"평가 중 ×{workers}", "#f0b429")
         if hasattr(self, "eval_preview_title"):
-            self.eval_preview_title.configure(text=f"병렬 평가 중  ·  워커 {workers}")
+            self.eval_preview_title.configure(text=f"평가 중  ·  워커 {workers}")
         if hasattr(self, "eval_progress_var"):
-            self.eval_progress_var.set("워커가 영상을 동시에 처리합니다...")
+            self.eval_progress_var.set("첫 프레임 준비 중... (모델 로딩)")
         if hasattr(self, "eval_metrics_var"):
             self.eval_metrics_var.set("진행 중 지표: -")
+        if hasattr(self, "eval_preview"):
+            self.eval_preview.configure(
+                image="",
+                text="모델 로딩 후 영상이 표시됩니다\n워커가 많으면 검게 보일 수 있어요 → 1로 낮춰보세요",
+                fg="#c5ccd6",
+                font=("Malgun Gothic", 11),
+                justify="center",
+            )
+            self.eval_preview_image = None
         self.eval_log.insert(
             0,
             f"평가 시작  accident={len(accident)} normal={len(normal)} workers={workers}",
         )
         cfg = self._make_eval_cfg()
+        # 미리보기 중엔 소형객체 확대가 GPU를 너무 먹을 수 있어 워커>1이면 끔
+        if workers > 1:
+            cfg.small_object_boost = False
+            cfg.imgsz = 960
         sensitivity = int(self.eval_sensitivity_var.get())
         conf = float(self.eval_conf_var.get())
         jobs = [("accident", p) for p in accident] + [
@@ -1744,8 +2388,8 @@ class StudioApp:
                     on_job_start=on_job_start,
                     on_job_done=on_job_done,
                     stop_event=self.stop_event,
-                    visual_stride=2,
-                    visual_max_width=640,
+                    visual_stride=1 if workers == 1 else 3,
+                    visual_max_width=960 if workers == 1 else 640,
                 )
 
                 if not results:
@@ -1828,11 +2472,15 @@ class StudioApp:
         self.worker.start()
 
     def _poll_messages(self) -> None:
+        if self._closing:
+            return
         while True:
             try:
                 kind, payload = self.messages.get_nowait()
             except queue.Empty:
                 break
+            if self._leaving:
+                continue
             if kind == "status":
                 self._set_status("추적 중", "#3ddc84")
             elif kind == "alert":
@@ -1856,6 +2504,33 @@ class StudioApp:
                 else:
                     if hasattr(self, "log"):
                         self.log.insert(0, "검토 영상 저장 실패")
+            elif kind == "youtube_done":
+                self._youtube_busy = False
+                if hasattr(self, "youtube_btn"):
+                    self.youtube_btn.configure(state="normal", text="가져오기")
+                if not payload or not payload.get("ok"):
+                    err = (payload or {}).get("error", "알 수 없는 오류")
+                    if hasattr(self, "youtube_status_var"):
+                        self.youtube_status_var.set(f"실패: {err[:80]}")
+                    self._set_youtube_save_enabled(False)
+                    if hasattr(self, "log"):
+                        self.log.insert(0, f"유튜브 다운로드 실패: {err}")
+                else:
+                    path = Path(str(payload["path"]))
+                    if path.exists():
+                        self._youtube_temp_path = path
+                        self._set_video_path(path, source_label="유튜브(임시)")
+                        self._refresh_video_library(select_path=path)
+                        if hasattr(self, "youtube_status_var"):
+                            self.youtube_status_var.set(
+                                f"임시 저장됨: {path.name}  → 필요하면 영구 저장"
+                            )
+                        if hasattr(self, "log"):
+                            self.log.insert(0, f"유튜브 임시 저장: {path}")
+                    else:
+                        if hasattr(self, "youtube_status_var"):
+                            self.youtube_status_var.set("다운로드 파일을 찾지 못했습니다")
+                        self._set_youtube_save_enabled(False)
             elif kind == "eval_progress":
                 if hasattr(self, "eval_log"):
                     self.eval_log.insert(0, str(payload))
@@ -1986,13 +2661,21 @@ class StudioApp:
                 )
                 if self._review_active and hasattr(self, "start_btn"):
                     self.start_btn.configure(text="다시 분석")
-        if self.mode == "capture":
-            self._paint_latest()
-        elif self.mode == "eval":
-            self._paint_eval_latest()
-        self.root.after(50, self._poll_messages)
+        if not self._leaving and not self._closing:
+            if self.mode == "capture":
+                self._paint_latest()
+            elif self.mode == "eval":
+                self._paint_eval_latest()
+        if not self._closing:
+            self.root.after(80, self._poll_messages)
 
     def _paint_eval_latest(self) -> None:
+        if self._leaving or self._closing or self.mode != "eval":
+            return
+        now = time.perf_counter()
+        # 미리보기 인코딩이 클릭/종료를 먹지 않게 초당 약 4회로 제한
+        if now - self._last_eval_paint < 0.25:
+            return
         with self._eval_visual_lock:
             active = dict(self._eval_visuals)
             focus = self._eval_focus_job
@@ -2007,6 +2690,7 @@ class StudioApp:
         vis = info.get("vis")
         if vis is None:
             return
+        self._last_eval_paint = now
         self._show_eval_bgr(vis)
         label = info.get("label", "")
         is_accident = label == "accident"
@@ -2168,27 +2852,15 @@ class StudioApp:
                 self.review_alert_var.set(f"알림 {len(self._review_alerts)}개")
 
     def _show_review_bgr(self, frame: np.ndarray) -> None:
-        """검토 재생용: JPEG로 빠르게 표시."""
+        """검토 재생용 빠른 표시 (색 유지 + PPM)."""
         if not hasattr(self, "preview"):
             return
         size_ref = getattr(self, "preview_host", self.preview)
-        canvas_w = max(size_ref.winfo_width(), 320)
-        canvas_h = max(size_ref.winfo_height(), 180)
-        scale = min(canvas_w / frame.shape[1], canvas_h / frame.shape[0])
-        view = cv2.resize(
-            frame,
-            (max(1, int(frame.shape[1] * scale)), max(1, int(frame.shape[0] * scale))),
-            interpolation=cv2.INTER_AREA,
-        )
-        canvas = np.full((canvas_h, canvas_w, 3), 16, dtype=np.uint8)
-        x0 = (canvas_w - view.shape[1]) // 2
-        y0 = (canvas_h - view.shape[0]) // 2
-        canvas[y0 : y0 + view.shape[0], x0 : x0 + view.shape[1]] = view
-        view = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        ok, buf = cv2.imencode(".png", view)
-        if not ok:
+        canvas_w, canvas_h = self._host_size(size_ref, "preview_image")
+        view = self._letterbox_bgr(frame, canvas_w, canvas_h)
+        photo = self._bgr_to_photo(view)
+        if photo is None:
             return
-        photo = tk.PhotoImage(data=buf.tobytes())
         self.preview_image = photo
         self.preview.configure(image=photo)
 
@@ -2270,14 +2942,18 @@ class StudioApp:
             visual = self._visual
         if visual is None:
             return
+        now = time.perf_counter()
+        # 미리보기 과도 갱신(PNG 시절)이 추적을 더 끊기게 만들어 초당 ~12회로 제한
+        paint_ui = now - self._last_capture_paint >= 0.08
         tracked, states, events, recent, toggles, fw, fh, vis, predicted = visual
         pred_n = len(predicted) if predicted is not None else 0
-        if hasattr(self, "preview_title"):
+        if paint_ui and hasattr(self, "preview_title"):
             self.preview_title.configure(
                 text=f"추적 중  ·  검출 {len(tracked)}개  ·  예측 {pred_n}개"
             )
-        if hasattr(self, "preview"):
+        if paint_ui and hasattr(self, "preview"):
             self._show_bgr(vis)
+            self._last_capture_paint = now
         if self.overlay is not None:
             self._paint_overlay(
                 tracked, states, events, recent, fw, fh, toggles, predicted=predicted
@@ -2296,7 +2972,7 @@ class StudioApp:
                 "use_accel_spike": bool(self.spike_var.get()),
                 "use_post_state_confirm": bool(self.confirm_var.get()),
                 "use_proximity_tag": bool(self.prox_var.get()),
-                "occlusion_hold_sec": float(self.occlusion_sec_var.get()),
+                "occlusion_hold_sec": self._occlusion_hold_from_ui(eval_mode=False),
             }
         self.overlay.present(
             tracked,
@@ -2317,16 +2993,48 @@ class StudioApp:
             self._visual = None
 
     def _on_close(self) -> None:
-        if self.tracking or self.evaluating:
-            self.stop_event.set()
+        if self._closing:
+            return
+        self._closing = True
+        self._leaving = True
+        self._abort_background_work()
+        self._stop_preview()
         try:
-            self._save_settings()
+            self._close_review()
         except Exception:
             pass
-        self._stop_preview()
-        self._close_review()
-        self._close_overlay()
-        self.root.destroy()
+        try:
+            self._close_overlay()
+        except Exception:
+            pass
+        # 유튜브 임시 파일은 종료 시 삭제
+        try:
+            self._cleanup_youtube_temp(keep=None)
+        except Exception:
+            pass
+        # 저장은 짧게 시도하고, 실패해도 종료는 막지 않는다.
+        try:
+            data = self._collect_settings()
+            SETTINGS_PATH.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        # destroy가 막히면 강제 종료
+        self.root.after(20, self._destroy_app)
+        self.root.after(1500, self._force_exit)
+
+    def _destroy_app(self) -> None:
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def _force_exit(self) -> None:
+        # 워커/Tk가 살아 있어도 프로세스 종료
+        os._exit(0)
 
     def run(self) -> None:
         self.root.mainloop()

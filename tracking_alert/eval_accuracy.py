@@ -60,14 +60,21 @@ class VideoResult:
     alerts: list[dict]
 
 
-def list_videos(folder: Path) -> List[Path]:
+def list_videos(folder: Path, recursive: bool = False) -> List[Path]:
     if not folder.exists():
         return []
-    files = [
-        p
-        for p in sorted(folder.iterdir())
-        if p.is_file() and p.suffix.lower() in VIDEO_EXTS
-    ]
+    if recursive:
+        files = [
+            p
+            for p in sorted(folder.rglob("*"))
+            if p.is_file() and p.suffix.lower() in VIDEO_EXTS
+        ]
+    else:
+        files = [
+            p
+            for p in sorted(folder.iterdir())
+            if p.is_file() and p.suffix.lower() in VIDEO_EXTS
+        ]
     return files
 
 
@@ -88,6 +95,8 @@ def evaluate_video(
         iou=cfg.iou,
         classes=cfg.classes,
         device=cfg.device,
+        small_object_boost=cfg.small_object_boost,
+        imgsz=cfg.imgsz,
     )
     motion = MotionEstimator(ema_alpha=cfg.event.ema_alpha)
     detector = AccidentSuspectDetector(cfg.event)
@@ -133,7 +142,12 @@ def evaluate_video(
         dets = [(o.track_id, *o.center) for o in tracked]
         states = motion.update(frame_idx, dets)
         bboxes = {o.track_id: tuple(map(float, o.bbox_xyxy)) for o in tracked}
-        fired = detector.update(frame_idx, states, bboxes=bboxes)
+        fired = detector.update(
+            frame_idx,
+            states,
+            bboxes=bboxes,
+            frame_shape=frame.shape[:2],
+        )
         if fired:
             alerts.extend(fired)
             recent.extend(fired)

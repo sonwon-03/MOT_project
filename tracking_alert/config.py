@@ -30,7 +30,7 @@ class EventConfig:
     use_proximity_tag: bool = True
 
     # 코너 선회 오탐 억제: 최근 헤딩이 이만큼 바뀌고 속도가 유지되면 사고로 보지 않음
-    turn_heading_deg: float = 28.0
+    turn_heading_deg: float = 18.0
     turn_speed_keep_ratio: float = 0.55
     # 확정 시에는 더 강하게 감속된 상태만 인정 (선회 중 잠깐 느려진 경우 제외)
     confirm_drop_ratio: float = 0.55
@@ -68,6 +68,11 @@ class AppConfig:
     output_dir: str = "outputs"
     # 가림 시 등속 예측 유지 시간(초). 0이면 기능 끔.
     occlusion_hold_sec: float = 1.0
+    # 저화질/소형 차량 검출 강화 (입력 확대 + 고해상도 추론)
+    small_object_boost: bool = True
+    imgsz: int = 1280
+    # 사고 의심 확정 시 시스템 알림음
+    sound_alert: bool = True
     event: EventConfig = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
