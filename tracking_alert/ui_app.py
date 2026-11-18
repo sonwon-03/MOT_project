@@ -1117,7 +1117,6 @@ class StudioApp:
         )
         spike = tk.BooleanVar(value=bool(saved.get("spike", True)))
         confirm = tk.BooleanVar(value=bool(saved.get("confirm", True)))
-        prox = tk.BooleanVar(value=bool(saved.get("prox", True)))
         small_boost = tk.BooleanVar(value=bool(saved.get("small_object_boost", True)))
         sound_alert = tk.BooleanVar(value=bool(saved.get("sound_alert", True)))
 
@@ -1125,7 +1124,7 @@ class StudioApp:
             parent,
             from_=0.5,
             to=5,
-            resolution=0.5,
+            resolution=0.25,
             orient="horizontal",
             variable=sens,
             bg=panel,
@@ -1135,7 +1134,7 @@ class StudioApp:
         ).pack(fill="x", padx=14)
         tk.Label(
             parent,
-            text="0.5 매우 둔감  ·  1  ·  1.5  ·  …  ·  5 민감",
+            text="0.5 매우 둔감  ·  1  ·  1.25  ·  1.5  ·  …  ·  5 민감  (0.25 단위)",
             bg=panel,
             fg="#9aa3b2",
             font=("Malgun Gothic", 9),
@@ -1328,7 +1327,6 @@ class StudioApp:
             ("소형/저화질 검출 강화", small_boost),
             ("가속도 급변", spike),
             ("급변 후 상태 유지", confirm),
-            ("근접하면 충돌 태그", prox),
         ):
             tk.Checkbutton(
                 parent,
@@ -1363,7 +1361,6 @@ class StudioApp:
             self.occlusion_sec_var = occ
             self.spike_var = spike
             self.confirm_var = confirm
-            self.prox_var = prox
             self.small_object_boost_var = small_boost
             self.sound_alert_var = sound_alert
         else:
@@ -1373,7 +1370,6 @@ class StudioApp:
             self.eval_occlusion_sec_var = occ
             self.eval_spike_var = spike
             self.eval_confirm_var = confirm
-            self.eval_prox_var = prox
             self.eval_small_object_boost_var = small_boost
             self.eval_sound_alert_var = sound_alert
 
@@ -1389,7 +1385,6 @@ class StudioApp:
                 "sound_alert": True,
                 "spike": True,
                 "confirm": True,
-                "prox": True,
             },
             "eval": {
                 "sensitivity": 3,
@@ -1400,7 +1395,6 @@ class StudioApp:
                 "sound_alert": False,
                 "spike": True,
                 "confirm": True,
-                "prox": True,
                 "workers": 1,
             },
             "review_speed": 1.0,
@@ -1439,7 +1433,6 @@ class StudioApp:
                 "sound_alert": bool(self.sound_alert_var.get()),
                 "spike": bool(self.spike_var.get()),
                 "confirm": bool(self.confirm_var.get()),
-                "prox": bool(self.prox_var.get()),
             }
         if hasattr(self, "eval_sensitivity_var"):
             data["eval"] = {
@@ -1451,7 +1444,6 @@ class StudioApp:
                 "sound_alert": bool(self.eval_sound_alert_var.get()),
                 "spike": bool(self.eval_spike_var.get()),
                 "confirm": bool(self.eval_confirm_var.get()),
-                "prox": bool(self.eval_prox_var.get()),
                 "workers": int(self.eval_workers_var.get())
                 if hasattr(self, "eval_workers_var")
                 else default_workers(),
@@ -1511,7 +1503,6 @@ class StudioApp:
                 self.sound_alert_var.set(bool(block.get("sound_alert", True)))
                 self.spike_var.set(bool(block.get("spike", True)))
                 self.confirm_var.set(bool(block.get("confirm", True)))
-                self.prox_var.set(bool(block.get("prox", True)))
             if key == "eval" and hasattr(self, "eval_sensitivity_var"):
                 self.eval_sensitivity_var.set(float(block.get("sensitivity", 3)))
                 self.eval_conf_var.set(float(block.get("conf", 0.01)))
@@ -1526,7 +1517,6 @@ class StudioApp:
                 self.eval_sound_alert_var.set(bool(block.get("sound_alert", False)))
                 self.eval_spike_var.set(bool(block.get("spike", True)))
                 self.eval_confirm_var.set(bool(block.get("confirm", True)))
-                self.eval_prox_var.set(bool(block.get("prox", True)))
                 if hasattr(self, "eval_workers_var") and "workers" in block:
                     self.eval_workers_var.set(int(block["workers"]))
         if hasattr(self, "review_speed_var") and data.get("review_speed") is not None:
@@ -1956,7 +1946,6 @@ class StudioApp:
         occlusion_sec: float,
         spike: bool,
         confirm: bool,
-        prox: bool,
         small_object_boost: bool = True,
         sound_alert: bool = True,
         output_dir: str = "outputs",
@@ -1971,7 +1960,7 @@ class StudioApp:
             event=EventConfig(
                 use_accel_spike=spike,
                 use_post_state_confirm=confirm,
-                use_proximity_tag=prox,
+                use_proximity_tag=False,
             ),
         )
         cfg.event.apply_sensitivity(float(sensitivity))
@@ -1993,7 +1982,6 @@ class StudioApp:
             self._occlusion_hold_from_ui(eval_mode=False),
             bool(self.spike_var.get()),
             bool(self.confirm_var.get()),
-            bool(self.prox_var.get()),
             bool(self.small_object_boost_var.get()),
             bool(self.sound_alert_var.get()),
         )
@@ -2005,7 +1993,6 @@ class StudioApp:
             self._occlusion_hold_from_ui(eval_mode=True),
             bool(self.eval_spike_var.get()),
             bool(self.eval_confirm_var.get()),
-            bool(self.eval_prox_var.get()),
             bool(self.eval_small_object_boost_var.get()),
             bool(self.eval_sound_alert_var.get()),
             output_dir="outputs/eval_accuracy",
@@ -3054,7 +3041,7 @@ class StudioApp:
             toggles = {
                 "use_accel_spike": bool(self.spike_var.get()),
                 "use_post_state_confirm": bool(self.confirm_var.get()),
-                "use_proximity_tag": bool(self.prox_var.get()),
+                "use_proximity_tag": False,
                 "occlusion_hold_sec": self._occlusion_hold_from_ui(eval_mode=False),
             }
         self.overlay.present(

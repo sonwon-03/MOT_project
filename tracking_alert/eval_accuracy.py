@@ -126,7 +126,6 @@ def evaluate_video(
     toggles = {
         "use_accel_spike": cfg.event.use_accel_spike,
         "use_post_state_confirm": cfg.event.use_post_state_confirm,
-        "use_proximity_tag": cfg.event.use_proximity_tag,
         "occlusion_hold_sec": cfg.occlusion_hold_sec,
     }
 

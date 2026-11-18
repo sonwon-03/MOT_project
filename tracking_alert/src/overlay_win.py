@@ -490,7 +490,6 @@ def _render_bgra(
     lines = [
         "F1 accel: " + ("ON" if toggles.get("use_accel_spike") else "OFF"),
         "F2 confirm: " + ("ON" if toggles.get("use_post_state_confirm") else "OFF"),
-        "F3 proximity: " + ("ON" if toggles.get("use_proximity_tag") else "OFF"),
         f"occlusion: {hold}s",
         "F9 quit | F12 save",
     ]

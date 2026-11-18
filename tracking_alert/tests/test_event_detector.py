@@ -21,14 +21,12 @@ def test_collision_stop_triggers_alert() -> None:
         cooldown_frames=100,
         use_accel_spike=True,
         use_post_state_confirm=True,
-        use_proximity_tag=True,
         ema_alpha=0.0,
     )
     motion = MotionEstimator(ema_alpha=0.0)
     det = AccidentSuspectDetector(cfg)
 
     def boxes(x1: float, x2: float) -> dict:
-        # 정지 시 중심 간격(~156px)에서도 박스 일부가 겹치게 한다.
         return {
             1: (x1 - 90, 160.0, x1 + 90, 240.0),
             2: (x2 - 90, 160.0, x2 + 90, 240.0),
@@ -42,7 +40,7 @@ def test_collision_stop_triggers_alert() -> None:
         states = motion.update(i, [(1, x1, 200.0), (2, x2, 200.0)])
         events.extend(det.update(i, states, bboxes=boxes(x1, x2)))
 
-    # 충돌 후 정지 (박스 겹침)
+    # 충돌 후 정지
     for j in range(8):
         i = 10 + j
         x1, x2 = xs1[-1], xs2[-1]
@@ -51,7 +49,7 @@ def test_collision_stop_triggers_alert() -> None:
 
     assert events, "충돌 후 정지에서 사고 의심 이벤트가 발생해야 합니다"
     assert any(e.category == "accident_suspect" for e in events)
-    assert any(e.tag == "collision_suspect" for e in events), events
+    assert any(e.tag == "accident_suspect" for e in events), events
     print("crash ok:", [(e.track_id, e.tag, e.reason) for e in events])
 
 
@@ -145,7 +143,7 @@ def test_headon_bounce_still_alerts() -> None:
 
 
 def test_sudden_interior_loss_alerts() -> None:
-    """근처 차량과 함께 고속 추적이 끊기면 정면충돌 후보로 알린다."""
+    """화면 안쪽에서 감속 직후 추적이 끊기면 사고 후보로 알린다."""
     cfg = EventConfig()
     cfg.apply_sensitivity(5)
     cfg.use_post_state_confirm = True
@@ -153,9 +151,10 @@ def test_sudden_interior_loss_alerts() -> None:
     motion = MotionEstimator(ema_alpha=0.0)
     det = AccidentSuspectDetector(cfg)
     events = []
-    for i in range(12):
-        x1 = 120 + i * 10
-        x2 = 420 - i * 10
+    # 고속 접근
+    for i in range(10):
+        x1 = 120 + i * 12
+        x2 = 420 - i * 12
         states = motion.update(i, [(9, float(x1), 200.0), (10, float(x2), 200.0)])
         events.extend(
             det.update(
@@ -168,8 +167,26 @@ def test_sudden_interior_loss_alerts() -> None:
                 frame_shape=(400, 640),
             )
         )
+    # 충돌 직전 급감속
+    for j, step in enumerate((4, 1, 0)):
+        i = 10 + j
+        x1 = 120 + 9 * 12 + step
+        x2 = 420 - 9 * 12 - step
+        states = motion.update(i, [(9, float(x1), 200.0), (10, float(x2), 200.0)])
+        events.extend(
+            det.update(
+                i,
+                states,
+                bboxes={
+                    9: (x1 - 50, 160, x1 + 50, 240),
+                    10: (x2 - 50, 160, x2 + 50, 240),
+                },
+                frame_shape=(400, 640),
+            )
+        )
+    # 추적 손실
     for j in range(5):
-        i = 12 + j
+        i = 13 + j
         events.extend(det.update(i, {}, bboxes={}, frame_shape=(400, 640)))
     assert events, events
     print("sudden loss ok:", [(e.track_id, e.reason) for e in events])

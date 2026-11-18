@@ -106,8 +106,6 @@ def handle_keys(key: int, cfg: AppConfig, frame_idx: int, vis: np.ndarray) -> bo
         toggle(cfg.event, "use_accel_spike")
     elif key == ord("2"):
         toggle(cfg.event, "use_post_state_confirm")
-    elif key == ord("3"):
-        toggle(cfg.event, "use_proximity_tag")
     elif key == ord("s"):
         snap = Path(cfg.output_dir) / f"frame_{frame_idx:05d}.jpg"
         cv2.imwrite(str(snap), vis)
@@ -219,7 +217,6 @@ def run_tracked_stream(
         toggles = {
             "use_accel_spike": cfg.event.use_accel_spike,
             "use_post_state_confirm": cfg.event.use_post_state_confirm,
-            "use_proximity_tag": cfg.event.use_proximity_tag,
             "occlusion_hold_sec": cfg.occlusion_hold_sec,
         }
         vis = draw_overlay(
@@ -312,7 +309,6 @@ def run_synthetic(cfg: AppConfig, show: bool, save_video: bool) -> None:
         toggles = {
             "use_accel_spike": cfg.event.use_accel_spike,
             "use_post_state_confirm": cfg.event.use_post_state_confirm,
-            "use_proximity_tag": cfg.event.use_proximity_tag,
         }
         vis = draw_overlay(frame, tracked, states, events, list(recent), toggles)
 
@@ -415,7 +411,7 @@ def run_screen(
             cap.region.left, cap.region.top, cap.region.width, cap.region.height
         )
         print("[overlay] 유튜브 화면 위에 박스만 표시합니다. 클릭은 그대로 통과합니다.")
-        print("[overlay] F1/F2/F3 조건 토글 | F12 저장 | F9 종료")
+        print("[overlay] F1/F2 조건 토글 | F12 저장 | F9 종료")
     elif show:
         print("[window] 별도 결과 창을 사용합니다.")
 

@@ -184,7 +184,6 @@ def draw_overlay(
     lines = [
         "[1] accel spike: " + ("ON" if toggles.get("use_accel_spike") else "OFF"),
         "[2] post confirm: " + ("ON" if toggles.get("use_post_state_confirm") else "OFF"),
-        "[3] proximity tag: " + ("ON" if toggles.get("use_proximity_tag") else "OFF"),
         f"occlusion hold: {hold}s",
         "q: quit | s: save frame",
     ]
