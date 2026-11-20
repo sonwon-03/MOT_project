@@ -32,6 +32,7 @@ from eval_accuracy import (
 )
 from main import run_screen, run_video
 from src.overlay_win import ScreenOverlay, enable_dpi_awareness
+from ui_mot import MotUIMixin
 
 SETTINGS_PATH = ROOT / "user_settings.json"
 YOUTUBE_TEMP_DIR = ROOT / "video_library" / "youtube_temp"
@@ -112,7 +113,7 @@ def pick_region(parent: tk.Misc, mon: dict) -> tuple[int, int, int, int] | None:
     return result.get("region")
 
 
-class StudioApp:
+class StudioApp(MotUIMixin):
     def __init__(self) -> None:
         enable_dpi_awareness()
         self.monitors = list_monitors()
@@ -291,9 +292,23 @@ class StudioApp:
             pady=18,
         ).pack(side="left", padx=8)
 
+        tk.Button(
+            btn_row,
+            text="MOT 성능 비교",
+            command=self._show_mot_compare,
+            bg="#7048a8",
+            fg="white",
+            activebackground="#5d3c8c",
+            activeforeground="white",
+            relief="flat",
+            font=("Malgun Gothic", 13, "bold"),
+            width=14,
+            pady=18,
+        ).pack(side="left", padx=8)
+
         tk.Label(
             center,
-            text="화면 캡처  ·  영상 파일/저장소  ·  eval_data 정확도",
+            text="화면 캡처  ·  영상 파일/저장소  ·  eval_data 사고 정확도  ·  MOT16 추적 지표(HOTA/MOTA/IDF1)",
             bg=bg,
             fg="#6f7886",
             font=("Malgun Gothic", 9),
@@ -808,6 +823,7 @@ class StudioApp:
             font=("Malgun Gothic", 8),
         ).pack(anchor="w", padx=14, pady=(4, 0))
 
+        self._build_model_tracker_section(side, panel, fg)
         self._build_shared_settings(side, panel, fg, prefix="cap")
 
         self.start_btn = tk.Button(
@@ -831,6 +847,8 @@ class StudioApp:
             font=("Malgun Gothic", 10),
             pady=4,
         ).pack(fill="x", padx=14, pady=(0, 6))
+
+        self._build_stats_section(side, panel, fg)
 
         tk.Label(
             side, text="로그", bg=panel, fg="#c5ccd6", font=("Malgun Gothic", 10)
@@ -1433,6 +1451,7 @@ class StudioApp:
                 "sound_alert": bool(self.sound_alert_var.get()),
                 "spike": bool(self.spike_var.get()),
                 "confirm": bool(self.confirm_var.get()),
+                **self._mot_settings(),
             }
         if hasattr(self, "eval_sensitivity_var"):
             data["eval"] = {
@@ -1490,6 +1509,7 @@ class StudioApp:
         for key in targets:
             block = data.get(key) or {}
             if key == "cap" and hasattr(self, "sensitivity_var"):
+                self._apply_mot_settings(block)
                 self.sensitivity_var.set(float(block.get("sensitivity", 3)))
                 self.conf_var.set(float(block.get("conf", 0.01)))
                 occ_sec = float(block.get("occlusion_sec", 1.0))
@@ -1976,6 +1996,11 @@ class StudioApp:
         return max(0.5, float(self.occlusion_sec_var.get()))
 
     def _make_cfg(self) -> AppConfig:
+        cfg = self._make_cfg_from_ui()
+        self._apply_model_tracker(cfg)
+        return cfg
+
+    def _make_cfg_from_ui(self) -> AppConfig:
         return self._make_cfg_from(
             float(self.sensitivity_var.get()),
             float(self.conf_var.get()),
@@ -2195,8 +2220,8 @@ class StudioApp:
         if hasattr(self, "log"):
             self.log.insert(
                 0,
-                f"적용 conf={cfg.conf:g}  imgsz={cfg.imgsz}  "
-                f"small_boost={cfg.small_object_boost}",
+                f"적용 model={Path(cfg.model_name).name}  tracker={cfg.tracker_backend}  "
+                f"conf={cfg.conf:g}  imgsz={cfg.imgsz}  small_boost={cfg.small_object_boost}",
             )
 
         mon = self._selected_monitor()
@@ -2246,6 +2271,9 @@ class StudioApp:
             self._session_alerts.append(event)
             self.messages.put(("alert", event))
 
+        def on_stats(stats: dict) -> None:
+            self.messages.put(("stats", stats))
+
         def work() -> None:
             self.messages.put(("status", "추적 중"))
             try:
@@ -2261,6 +2289,7 @@ class StudioApp:
                         stop_event=self.stop_event,
                         on_alert=on_alert,
                         on_visual=on_visual,
+                        on_stats=on_stats,
                     )
                     self.messages.put(("stopped", None))
                 else:
@@ -2275,6 +2304,9 @@ class StudioApp:
                         on_alert=on_alert,
                         on_visual=on_visual,
                         out_name=review_name,
+                        track_out_dir=review_dir,
+                        track_name="last",
+                        on_stats=on_stats,
                     )
                     alerts = [
                         {
@@ -2550,6 +2582,8 @@ class StudioApp:
             except queue.Empty:
                 break
             if self._leaving:
+                continue
+            if self._handle_mot_message(kind, payload):
                 continue
             if kind == "status":
                 self._set_status("추적 중", "#3ddc84")

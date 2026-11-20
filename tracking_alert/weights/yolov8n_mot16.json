@@ -1,0 +1,25 @@
+{
+  "base": "yolov8n.pt",
+  "epochs": 10,
+  "imgsz": 640,
+  "batch": 8,
+  "lr0": 0.002,
+  "freeze": 10,
+  "device": "cpu",
+  "train_minutes": 24.6,
+  "data": "MOT16 train(02,04,13) / val(10,11), 8프레임 간격 샘플, person 1클래스",
+  "val_before": {
+    "mAP50": 0.7081927010948956,
+    "mAP50-95": 0.4354878560354904,
+    "precision": 0.8727998087009906,
+    "recall": 0.6044303797468354
+  },
+  "val_after": {
+    "mAP50": 0.722023234863528,
+    "mAP50-95": 0.40148103649182687,
+    "precision": 0.8054729631763665,
+    "recall": 0.6243218806509946
+  },
+  "weights": "weights\\yolov8n_mot16.pt",
+  "created": "2026-11-19 13:09"
+}

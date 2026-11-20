@@ -61,6 +61,48 @@ python eval_accuracy.py --data eval_data
 
 결과는 `outputs/eval_accuracy/`에 저장됩니다. (영상 파일은 git에 올리지 않습니다.)
 
+## 다중 객체 추적(MOT) 성능 평가 · 개선
+
+과제 요구사항(데이터 분할, 추적기 구현·개선, HOTA/MOTA/IDF1, FPS, Fine-tuning)을 위한 기능입니다.
+
+### 추적기 (`src/bytetrack.py`, 직접 구현)
+
+ByteTrack 처리 과정(칼만 예측 → high 검출 1차 연관 → low 검출 2차 연관 → 미확정 트랙 처리 → 유실/제거 → 신규 생성)을 직접 구현했고, 두 가지를 개선했습니다.
+
+| 개선 | 내용 | 관련 요구사항 |
+| --- | --- | --- |
+| A. 외형 특징 융합 | 박스 안 HSV 색 히스토그램(Bhattacharyya 거리)을 IoU 비용과 가중합 | 특징 추출 · 연관성 판단 |
+| B. 유실 트랙 재연결 | IoU로 못 붙은 새 검출을 Lost/최근 제거 트랙과 예측 중심 거리·크기·외형으로 재비교해 예전 ID 복원 | 이동 예측 · 추적 상태 관리 · 재등장 |
+
+GUI의 **추적 알고리즘**에서 직접 구현(사고 감지용/최종 개선/개선/기본값)과 Ultralytics 내장(비교 기준)을 고를 수 있습니다.
+
+### 데이터셋 · 평가
+
+MOT16 공개 데이터셋(정답 박스·ID 포함)을 시퀀스 단위로 나눕니다.
+
+| 분할 | 시퀀스 | 용도 |
+| --- | --- | --- |
+| train | MOT16-02, 04, 13 | YOLO Fine-tuning |
+| val | MOT16-10, 11 | Fine-tuning 검증, 추적 파라미터 튜닝 |
+| test | MOT16-05, 09 | 최종 비교 (튜닝·학습에 미사용) |
+
+```powershell
+# MOT16.zip(1.9GB)을 datasets/ 에 받은 뒤
+python mot_eval.py prepare   # 압축 해제, 분할, YOLO 형식 변환(datasets/mot16_yolo)
+python finetune.py --epochs 10   # → weights/yolov8n_mot16.pt (+ .json 학습 기록)
+python mot_eval.py tune      # val 격자 탐색 → configs/tuned_tracker.json
+python mot_eval.py eval      # test 비교 → outputs/mot_eval/summary.json / summary.csv
+```
+
+지표: HOTA(DetA/AssA, 직접 구현), MOTA, IDF1, ID Switch, FP/FN, MT/ML, Frag(motmetrics), 프레임당 처리 시간·FPS.
+메인 화면 **MOT 성능 비교**에서 같은 작업을 버튼으로 실행하고 결과 표·그래프를 볼 수 있습니다.
+
+### 궤적 · 결과 저장/불러오기
+
+- 추적 중 객체별 이동 경로(ID 색 선), 이동 방향(8방위), 누적 이동 거리, 평균 속도를 계산·표시
+- 영상 추적이 끝나면 `outputs/review/last_tracks.csv`(프레임·ID·좌표), `last_tracks.mot.txt`(MOT 형식), `last_meta.json`(모델·추적기 설정·성능·궤적 요약) 저장
+- **추적 결과 불러오기**로 저장된 CSV를 원본 영상 위에 다시 그려 재생 (재추적 없음)
+
 ## 기타 실행
 
 ```powershell

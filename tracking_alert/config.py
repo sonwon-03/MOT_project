@@ -106,6 +106,12 @@ class AppConfig:
     imgsz: int = 1280
     # 사고 의심 확정 시 시스템 알림음
     sound_alert: bool = True
+    # 추적기: "custom" = 직접 구현 ByteTrack(src/bytetrack.py), "ultralytics" = 내장 model.track
+    tracker_backend: str = "custom"
+    # 직접 구현 ByteTrack 파라미터. None이면 conf에 맞춰 자동(기존 사고 감지 방식)
+    tracker_params: dict | None = None
+    # 이동 궤적(경로) 선 표시
+    draw_trajectory: bool = True
     event: EventConfig = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:

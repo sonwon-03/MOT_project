@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -7,6 +8,8 @@ from typing import Optional
 
 import cv2
 import numpy as np
+
+from src.bytetrack import ByteTracker, ByteTrackParams
 
 _CONFIGS = Path(__file__).resolve().parents[1] / "configs"
 # 병렬 평가에서 GPU 추론이 동시에 겹치면 화면이 멈추는 경우가 있어 직렬화
@@ -56,6 +59,46 @@ def _tracker_yaml_for_conf(conf: float) -> str:
     return str(path)
 
 
+def params_for_conf(conf: float) -> dict:
+    """기존 tracking_alert 방식: 검출 신뢰도에 맞춰 ByteTrack 임계값을 정한다 (사고 감지용 기본)."""
+    conf = float(max(1e-4, min(0.9, conf)))
+    return {
+        "track_high_thresh": conf,
+        "track_low_thresh": max(1e-4, conf * 0.5),
+        "new_track_thresh": conf,
+        "track_buffer": 60,
+        "match_thresh": 0.7,
+        "fuse_score": True,
+    }
+
+
+# 비교 실험용 프리셋 (mot_eval.py / GUI에서 사용)
+#  - baseline : 원 ByteTrack 기본값 (Ultralytics bytetrack.yaml과 동일)
+#  - improved : 기본값 + 외형 특징 융합(A) + 유실 트랙 재연결(B)
+#  tuned 값은 mot_eval.py tune 결과가 configs/tuned_tracker.json 에 저장된다.
+BASELINE_PARAMS = {
+    "track_high_thresh": 0.25,
+    "track_low_thresh": 0.1,
+    "new_track_thresh": 0.25,
+    "track_buffer": 30,
+    "match_thresh": 0.8,
+    "fuse_score": True,
+}
+IMPROVED_PARAMS = dict(BASELINE_PARAMS, appearance_weight=0.3, relink=True)
+TUNED_PATH = _CONFIGS / "tuned_tracker.json"
+
+
+def load_tuned_params() -> Optional[dict]:
+    import json
+
+    if TUNED_PATH.exists():
+        try:
+            return json.loads(TUNED_PATH.read_text(encoding="utf-8")).get("params")
+        except Exception:
+            return None
+    return None
+
+
 def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
@@ -88,14 +131,26 @@ class YoloByteTracker:
         device: Optional[str] = None,
         small_object_boost: bool = True,
         imgsz: int = 1280,
+        backend: str = "custom",
+        tracker_params: Optional[dict] = None,
+        frame_rate: float = 30.0,
     ) -> None:
         from ultralytics import YOLO
 
         self.model = YOLO(model_name)
+        # backend: "custom" = 직접 구현 ByteTrack(src/bytetrack.py, 개선 포함)
+        #          "ultralytics" = 라이브러리 내장 model.track (비교 기준선)
+        self.backend = backend if backend in ("custom", "ultralytics") else "custom"
         if tracker_cfg in ("bytetrack.yaml", "botsort.yaml") or not Path(tracker_cfg).is_file():
             self.tracker_cfg = _tracker_yaml_for_conf(conf)
         else:
             self.tracker_cfg = tracker_cfg
+        self.byte_params = ByteTrackParams.from_dict(
+            tracker_params if tracker_params else params_for_conf(conf)
+        )
+        self.byte = ByteTracker(self.byte_params, frame_rate=frame_rate)
+        self.last_infer_ms = 0.0
+        self.last_track_ms = 0.0
         self.conf = float(conf)
         self.iou = iou
         self.classes = list(classes) if classes is not None else None
@@ -132,8 +187,61 @@ class YoloByteTracker:
             imgsz = _round_imgsz(max(960, min(h, w)))
         return view, scale, imgsz
 
-    def track_frame(self, frame: np.ndarray) -> list[TrackedObject]:
+    # ── 직접 구현 ByteTrack 경로 ─────────────────────────────
+    def detect(self, frame: np.ndarray) -> np.ndarray:
+        """YOLO 검출만 수행. (N,6) [x1,y1,x2,y2,score,cls] 원본 좌표."""
         view, scale, imgsz = self._prepare_frame(frame)
+        det_conf = min(float(self.conf), float(self.byte_params.track_low_thresh))
+        t0 = time.perf_counter()
+        with _INFER_LOCK:
+            r0 = self.model.predict(
+                source=view,
+                conf=max(1e-4, det_conf),
+                iou=self.iou,
+                classes=self.classes,
+                device=self.device,
+                imgsz=imgsz,
+                max_det=int(self.max_det),
+                verbose=False,
+            )[0]
+        self.last_infer_ms = (time.perf_counter() - t0) * 1000.0
+        if r0.boxes is None or len(r0.boxes) == 0:
+            return np.zeros((0, 6))
+        boxes = r0.boxes.xyxy.cpu().numpy()
+        if scale != 1.0:
+            boxes = boxes / scale
+        confs = r0.boxes.conf.cpu().numpy()
+        clss = r0.boxes.cls.cpu().numpy()
+        wh = np.maximum(boxes[:, 2:4] - boxes[:, 0:2], 0.0)
+        keep = wh[:, 0] * wh[:, 1] >= 64.0  # 약 8x8 미만 노이즈 제거
+        return np.column_stack([boxes[keep], confs[keep], clss[keep]])
+
+    def associate(self, dets: np.ndarray, frame: Optional[np.ndarray] = None) -> list[TrackedObject]:
+        """검출 → 직접 구현 ByteTrack 연관 → TrackedObject 목록."""
+        if len(dets) > self.keep_top:
+            dets = dets[np.argsort(-dets[:, 4])[: self.keep_top]]
+        t0 = time.perf_counter()
+        tracks = self.byte.update(dets, frame)
+        self.last_track_ms = (time.perf_counter() - t0) * 1000.0
+        return [
+            TrackedObject(
+                track_id=int(t.track_id),
+                bbox_xyxy=tuple(map(float, t.box.tolist())),
+                conf=float(t.score),
+                cls_id=int(t.cls_id),
+                label=str(self.names.get(int(t.cls_id), t.cls_id)),
+            )
+            for t in tracks
+        ]
+
+    def track_frame(self, frame: np.ndarray) -> list[TrackedObject]:
+        if self.backend == "custom":
+            return self.associate(self.detect(frame), frame)
+        return self._track_ultralytics(frame)
+
+    def _track_ultralytics(self, frame: np.ndarray) -> list[TrackedObject]:
+        view, scale, imgsz = self._prepare_frame(frame)
+        t0 = time.perf_counter()
         with _INFER_LOCK:
             results = self.model.track(
                 source=view,
@@ -147,6 +255,8 @@ class YoloByteTracker:
                 max_det=int(self.max_det),
                 verbose=False,
             )
+        self.last_infer_ms = (time.perf_counter() - t0) * 1000.0
+        self.last_track_ms = 0.0
         if not results:
             self._fallback.clear()
             return []

@@ -1,0 +1,35 @@
+{
+  "params": {
+    "track_high_thresh": 0.4,
+    "track_low_thresh": 0.1,
+    "new_track_thresh": 0.4,
+    "track_buffer": 60,
+    "match_thresh": 0.9,
+    "fuse_score": true,
+    "appearance_weight": 0.0,
+    "relink": true,
+    "relink_max_gap": 60
+  },
+  "val_metrics": {
+    "MOTA": 0.43234691978410567,
+    "IDF1": 0.5375806787424526,
+    "IDSW": 65,
+    "MOTP": 0.8080326735864221,
+    "FP": 1386,
+    "FN": 10749,
+    "MT": 29,
+    "ML": 56,
+    "Frag": 193,
+    "Precision": 0.8857284194904773,
+    "Recall": 0.4998604131769961,
+    "HOTA": 0.4525246768944603,
+    "DetA": 0.3975251406132923,
+    "AssA": 0.5204857491690514,
+    "LocA": 0.8264966813180346
+  },
+  "val_seqs": [
+    "MOT16-10",
+    "MOT16-11"
+  ],
+  "model": "yolov8n.pt"
+}

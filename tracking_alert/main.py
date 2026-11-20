@@ -21,7 +21,18 @@ from src.event_logger import EventLogger
 from src.motion import MotionEstimator, bbox_scale
 from src.occlusion import OcclusionPredictor
 from src.synthetic import generate_collision_scene
+from src.track_io import TrackWriter
+from src.trajectory import TrajectoryStore
 from src.visualize import draw_overlay
+
+
+def draw_perf(vis: np.ndarray, fps: float, det_ms: float, trk_ms: float, n: int) -> None:
+    """오른쪽 위에 처리 성능 표시."""
+    text = f"{fps:.1f} FPS | det {det_ms:.0f}ms trk {trk_ms:.1f}ms | {n} obj"
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    x = max(4, vis.shape[1] - tw - 12)
+    cv2.rectangle(vis, (x - 6, 6), (vis.shape[1] - 4, 14 + th), (20, 20, 20), -1)
+    cv2.putText(vis, text, (x, 10 + th), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 255, 255), 2, cv2.LINE_AA)
 
 
 def parse_args() -> argparse.Namespace:
@@ -125,7 +136,11 @@ def run_tracked_stream(
     stop_event=None,
     on_alert: Callable | None = None,
     on_visual: Callable | None = None,
-) -> None:
+    track_out_dir: Optional[Path] = None,
+    track_name: str = "last",
+    on_stats: Callable | None = None,
+    source_label: str = "",
+) -> dict:
     """프레임 수/FPS 상한 없이 들어오는 프레임을 전부 처리한다.
 
     fps_hint <= 0 이면 실제 처리 속도를 측정해 녹화·가림 타이밍에 쓴다.
@@ -141,9 +156,16 @@ def run_tracked_stream(
         device=cfg.device,
         small_object_boost=cfg.small_object_boost,
         imgsz=cfg.imgsz,
+        backend=cfg.tracker_backend,
+        tracker_params=cfg.tracker_params,
+        frame_rate=float(fps_hint) if float(fps_hint) > 1.0 else 30.0,
     )
     motion = MotionEstimator(ema_alpha=cfg.event.ema_alpha)
     detector = AccidentSuspectDetector(cfg.event)
+    trajectories = TrajectoryStore()
+    track_writer = TrackWriter(track_out_dir, track_name) if track_out_dir is not None else None
+    proc_ms: deque = deque(maxlen=30)  # 최근 30프레임 처리 시간 (FPS 표시용)
+    total_ms = det_total = trk_total = 0.0
     # fps_hint>0: 영상 메타 FPS / <=0: 측정 전까지 임시값
     known_fps = float(fps_hint) if float(fps_hint) > 1.0 else None
     occlusion = OcclusionPredictor(
@@ -187,7 +209,11 @@ def run_tracked_stream(
         if frame is None:
             break
 
+        t_frame = time.perf_counter()
         tracked = tracker.track_frame(frame)
+        trajectories.update(frame_idx, tracked)
+        if track_writer is not None:
+            track_writer.write(frame_idx, tracked)
         dets = [
             (o.track_id, *o.center, bbox_scale(o.bbox_xyxy)) for o in tracked
         ]
@@ -222,6 +248,30 @@ def run_tracked_stream(
         vis = draw_overlay(
             frame, tracked, states, events, list(recent), toggles, predicted=predicted
         )
+        active_ids = {o.track_id for o in tracked}
+        if cfg.draw_trajectory:
+            trajectories.draw(vis, active_ids)
+        # 처리 시간 = 검출 + 추적 + 운동추정 + 판정 + 그리기 (영상 읽기 제외)
+        ms = (time.perf_counter() - t_frame) * 1000.0
+        proc_ms.append(ms)
+        total_ms += ms
+        det_total += tracker.last_infer_ms
+        trk_total += tracker.last_track_ms
+        fps_now = 1000.0 / max(1e-6, sum(proc_ms) / len(proc_ms))
+        draw_perf(vis, fps_now, tracker.last_infer_ms, tracker.last_track_ms, len(tracked))
+        if on_stats is not None and frame_idx % 5 == 0:
+            on_stats(
+                {
+                    "frame": frame_idx + 1,
+                    "fps": fps_now,
+                    "ms": sum(proc_ms) / len(proc_ms),
+                    "det_ms": tracker.last_infer_ms,
+                    "trk_ms": tracker.last_track_ms,
+                    "objects": len(tracked),
+                    "unique_ids": len(trajectories.paths),
+                    "trajectories": trajectories.summary(active_ids)[:12],
+                }
+            )
 
         if save_video:
             if writer is None and write_fps is None and frame_idx < 12:
@@ -271,7 +321,34 @@ def run_tracked_stream(
         writer.release()
         print(f"[save] {out_path}  fps={write_fps}")
     cv2.destroyAllWindows()
-    print(f"[done] events={len(detector.events)} log={logger.csv_path}")
+    n = max(1, frame_idx)
+    stats = {
+        "frames": frame_idx,
+        "avg_ms_per_frame": round(total_ms / n, 2),
+        "avg_fps": round(1000.0 / max(total_ms / n, 1e-6), 2),
+        "avg_det_ms": round(det_total / n, 2),
+        "avg_track_ms": round(trk_total / n, 3),
+        "events": len(detector.events),
+    }
+    if track_writer is not None:
+        track_writer.close(
+            {
+                "source": source_label,
+                "model": cfg.model_name,
+                "tracker_backend": tracker.backend,
+                "tracker_params": vars(tracker.byte_params) if tracker.backend == "custom" else tracker.tracker_cfg,
+                "conf": cfg.conf,
+                "iou": cfg.iou,
+                "small_object_boost": cfg.small_object_boost,
+                "performance": stats,
+                "relinks": tracker.byte.relink_count,
+                "trajectories": trajectories.summary(),
+                "review_video": str(out_path) if save_video else None,
+            }
+        )
+        stats["track_csv"] = str(track_writer.csv_path)
+    print(f"[done] events={len(detector.events)} log={logger.csv_path} perf={stats}")
+    return stats
 
 
 def run_synthetic(cfg: AppConfig, show: bool, save_video: bool) -> None:
@@ -347,6 +424,9 @@ def run_video(
     on_alert: Callable | None = None,
     on_visual: Callable | None = None,
     out_name: str = "tracked_alert.mp4",
+    track_out_dir: Optional[Path] = None,
+    track_name: str = "last",
+    on_stats: Callable | None = None,
 ) -> Path | None:
     cap_source: str | int = 0 if source == "webcam" else source
     cap = cv2.VideoCapture(cap_source)
@@ -374,6 +454,10 @@ def run_video(
             stop_event=stop_event,
             on_alert=on_alert,
             on_visual=on_visual,
+            track_out_dir=track_out_dir,
+            track_name=track_name,
+            on_stats=on_stats,
+            source_label=str(source),
         )
     finally:
         cap.release()
@@ -395,6 +479,7 @@ def run_screen(
     on_visual: Callable | None = None,
     before_grab: Callable | None = None,
     after_grab: Callable | None = None,
+    on_stats: Callable | None = None,
 ) -> None:
     from src.overlay_win import ScreenOverlay, enable_dpi_awareness
     from src.screen_capture import ScreenCapture
@@ -438,6 +523,8 @@ def run_screen(
             stop_event=stop_event,
             on_alert=on_alert,
             on_visual=on_visual,
+            on_stats=on_stats,
+            source_label="screen",
         )
     finally:
         if overlay is not None:

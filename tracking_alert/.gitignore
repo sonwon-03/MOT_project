@@ -19,3 +19,7 @@ configs/bytetrack_conf*.yaml
 .DS_Store
 .idea/
 .vscode/
+
+# MOT 평가 데이터셋 / 학습 가중치 (용량 큼)
+datasets/
+weights/*.pt
